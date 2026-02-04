@@ -1601,7 +1601,7 @@ index b8fecd903..4a98760be 100644
 2.34.1
 
 
-From 75a218f8b655c14d785e22e7bac39c093f80b8ac Mon Sep 17 00:00:00 2001
+From 9a508f37845512af840e9daa11d53b886811afbc Mon Sep 17 00:00:00 2001
 From: Eduarda Veras <eduarda.martins@gprt.ufpe.br>
 Date: Tue, 3 Feb 2026 16:36:13 -0300
 Subject: [PATCH 3/3] internet: Add TCP Prague congestion control
@@ -1611,9 +1611,9 @@ RTT independence and dynamic pacing. Algorithm is aligned
 with Linux kernel implementation.
 ---
  src/internet/CMakeLists.txt      |   2 +
- src/internet/model/tcp-prague.cc | 844 +++++++++++++++++++++++++++++++
- src/internet/model/tcp-prague.h  | 255 ++++++++++
- 3 files changed, 1101 insertions(+)
+ src/internet/model/tcp-prague.cc | 845 +++++++++++++++++++++++++++++++
+ src/internet/model/tcp-prague.h  | 256 ++++++++++
+ 3 files changed, 1103 insertions(+)
  create mode 100644 src/internet/model/tcp-prague.cc
  create mode 100644 src/internet/model/tcp-prague.h
 
@@ -1639,16 +1639,17 @@ index a105dcd2d..d56a1cec1 100644
      model/tcp-recovery-ops.h
 diff --git a/src/internet/model/tcp-prague.cc b/src/internet/model/tcp-prague.cc
 new file mode 100644
-index 000000000..bc9e5f15d
+index 000000000..20d7a3359
 --- /dev/null
 +++ b/src/internet/model/tcp-prague.cc
-@@ -0,0 +1,844 @@
+@@ -0,0 +1,845 @@
 +/*
 + * Copyright (c) 2026 GPRT
 + *
 + * SPDX-License-Identifier: GPL-2.0-only
 + *
 + * Author: Maria Eduarda Veras <maria.martins@gprt.ufpe.br>
++ * Author: Eduardo Freitas <eduardo.freitas@gprt.ufpe.br>
 + *
 + */
 +
@@ -2490,16 +2491,17 @@ index 000000000..bc9e5f15d
 \ No newline at end of file
 diff --git a/src/internet/model/tcp-prague.h b/src/internet/model/tcp-prague.h
 new file mode 100644
-index 000000000..348fbb277
+index 000000000..8879b10be
 --- /dev/null
 +++ b/src/internet/model/tcp-prague.h
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,256 @@
 +/*
 + * Copyright (c) 2026 GPRT
 + *
 + * SPDX-License-Identifier: GPL-2.0-only
 + *
 + * Author: Maria Eduarda Veras <maria.martins@gprt.ufpe.br>
++ * Author: Eduardo Freitas <eduardo.freitas@gprt.ufpe.br>
 + *
 + */
 +
