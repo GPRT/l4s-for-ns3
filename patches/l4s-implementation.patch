@@ -1,0 +1,2755 @@
+From 5ca235e126f405c552b493732acb662dde0acf95 Mon Sep 17 00:00:00 2001
+From: Eduarda Veras <eduarda.martins@gprt.ufpe.br>
+Date: Tue, 3 Feb 2026 16:35:21 -0300
+Subject: [PATCH 1/3] traffic-control: Add DualQ Coupled PI Square queue disc
+
+---
+ src/traffic-control/CMakeLists.txt            |   2 +
+ .../model/dualq-coupled-pi2-queue-disc.cc     | 474 ++++++++++++++++++
+ .../model/dualq-coupled-pi2-queue-disc.h      | 177 +++++++
+ 3 files changed, 653 insertions(+)
+ create mode 100644 src/traffic-control/model/dualq-coupled-pi2-queue-disc.cc
+ create mode 100644 src/traffic-control/model/dualq-coupled-pi2-queue-disc.h
+
+diff --git a/src/traffic-control/CMakeLists.txt b/src/traffic-control/CMakeLists.txt
+index 088ca6f63..b011a1480 100644
+--- a/src/traffic-control/CMakeLists.txt
++++ b/src/traffic-control/CMakeLists.txt
+@@ -5,6 +5,7 @@ build_lib(
+     helper/traffic-control-helper.cc
+     model/cobalt-queue-disc.cc
+     model/codel-queue-disc.cc
++    model/dualq-coupled-pi2-queue-disc.cc
+     model/fifo-queue-disc.cc
+     model/fq-cobalt-queue-disc.cc
+     model/fq-codel-queue-disc.cc
+@@ -23,6 +24,7 @@ build_lib(
+     helper/traffic-control-helper.h
+     model/cobalt-queue-disc.h
+     model/codel-queue-disc.h
++    model/dualq-coupled-pi2-queue-disc.h
+     model/fifo-queue-disc.h
+     model/fq-cobalt-queue-disc.h
+     model/fq-codel-queue-disc.h
+diff --git a/src/traffic-control/model/dualq-coupled-pi2-queue-disc.cc b/src/traffic-control/model/dualq-coupled-pi2-queue-disc.cc
+new file mode 100644
+index 000000000..355019a0c
+--- /dev/null
++++ b/src/traffic-control/model/dualq-coupled-pi2-queue-disc.cc
+@@ -0,0 +1,474 @@
++/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
++/*
++ * Copyright (c) 2017 NITK Surathkal
++ * Copyright (c) 2019 Tom Henderson (update to IETF draft -10)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation;
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ * Author: Shravya K.S. <shravya.ks0@gmail.com>
++ *
++ */
++
++#include "dualq-coupled-pi2-queue-disc.h"
++
++#include "ns3/abort.h"
++#include "ns3/assert.h"
++#include "ns3/double.h"
++#include "ns3/drop-tail-queue.h"
++#include "ns3/enum.h"
++#include "ns3/fatal-error.h"
++#include "ns3/log.h"
++#include "ns3/net-device-queue-interface.h"
++#include "ns3/object-factory.h"
++#include "ns3/simulator.h"
++#include "ns3/string.h"
++#include "ns3/uinteger.h"
++
++#include <cmath>
++#include <cstddef>
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("DualQCoupledPi2QueueDisc");
++
++NS_OBJECT_ENSURE_REGISTERED(DualQCoupledPi2QueueDisc);
++
++const std::size_t CLASSIC = 0;
++const std::size_t L4S = 1;
++
++TypeId
++DualQCoupledPi2QueueDisc::GetTypeId(void)
++{
++    static TypeId tid =
++        TypeId("ns3::DualQCoupledPi2QueueDisc")
++            .SetParent<QueueDisc>()
++            .SetGroupName("TrafficControl")
++            .AddConstructor<DualQCoupledPi2QueueDisc>()
++            .AddAttribute("Mtu",
++                          "Device MTU (bytes); if zero, will be automatically configured",
++                          UintegerValue(0),
++                          MakeUintegerAccessor(&DualQCoupledPi2QueueDisc::m_mtu),
++                          MakeUintegerChecker<uint32_t>())
++            .AddAttribute("A",
++                          "Value of alpha (Hz)",
++                          DoubleValue(0.16),
++                          MakeDoubleAccessor(&DualQCoupledPi2QueueDisc::m_alpha),
++                          MakeDoubleChecker<double>())
++            .AddAttribute("B",
++                          "Value of beta (Hz)",
++                          DoubleValue(3.2),
++                          MakeDoubleAccessor(&DualQCoupledPi2QueueDisc::m_beta),
++                          MakeDoubleChecker<double>())
++            .AddAttribute("Tupdate",
++                          "Time period to calculate drop probability",
++                          TimeValue(MilliSeconds(16)),
++                          MakeTimeAccessor(&DualQCoupledPi2QueueDisc::m_tUpdate),
++                          MakeTimeChecker())
++            .AddAttribute("Tshift",
++                          "Time offset for TS-FIFO scheduler",
++                          TimeValue(MilliSeconds(50)),
++                          MakeTimeAccessor(&DualQCoupledPi2QueueDisc::m_tShift),
++                          MakeTimeChecker())
++            .AddAttribute("QueueLimit",
++                          "Queue limit in bytes",
++                          UintegerValue(1562500), // 250 ms at 50 Mbps
++                          MakeUintegerAccessor(&DualQCoupledPi2QueueDisc::m_queueLimit),
++                          MakeUintegerChecker<uint32_t>())
++            .AddAttribute("Target",
++                          "PI AQM Classic queue delay target",
++                          TimeValue(MilliSeconds(15)),
++                          MakeTimeAccessor(&DualQCoupledPi2QueueDisc::m_target),
++                          MakeTimeChecker())
++            .AddAttribute("L4SMarkThresold",
++                          "L4S marking threshold in Time",
++                          TimeValue(MilliSeconds(1)),
++                          MakeTimeAccessor(&DualQCoupledPi2QueueDisc::m_minTh),
++                          MakeTimeChecker())
++            .AddAttribute("K",
++                          "Coupling factor",
++                          DoubleValue(2),
++                          MakeDoubleAccessor(&DualQCoupledPi2QueueDisc::m_k),
++                          MakeDoubleChecker<double>())
++            .AddAttribute("StartTime", // Only if user wants to change queue start time
++                          "Simulation time to start scheduling the update timer",
++                          TimeValue(Seconds(0.0)),
++                          MakeTimeAccessor(&DualQCoupledPi2QueueDisc::m_startTime),
++                          MakeTimeChecker())
++            .AddTraceSource("ProbCL",
++                            "Coupled probability (p_CL)",
++                            MakeTraceSourceAccessor(&DualQCoupledPi2QueueDisc::m_pCL),
++                            "ns3::TracedValueCallback::Double")
++            .AddTraceSource("ProbL",
++                            "L4S mark probability (p_L)",
++                            MakeTraceSourceAccessor(&DualQCoupledPi2QueueDisc::m_pL),
++                            "ns3::TracedValueCallback::Double")
++            .AddTraceSource("ProbC",
++                            "Classic drop/mark probability (p_C)",
++                            MakeTraceSourceAccessor(&DualQCoupledPi2QueueDisc::m_pC),
++                            "ns3::TracedValueCallback::Double")
++            .AddTraceSource(
++                "ClassicSojournTime",
++                "Sojourn time of the last packet dequeued from the Classic queue",
++                MakeTraceSourceAccessor(&DualQCoupledPi2QueueDisc::m_traceClassicSojourn),
++                "ns3::Time::TracedCallback")
++            .AddTraceSource("L4sSojournTime",
++                            "Sojourn time of the last packet dequeued from the L4S queue",
++                            MakeTraceSourceAccessor(&DualQCoupledPi2QueueDisc::m_traceL4sSojourn),
++                            "ns3::Time::TracedCallback");
++    return tid;
++}
++
++DualQCoupledPi2QueueDisc::DualQCoupledPi2QueueDisc()
++    : QueueDisc()
++{
++    NS_LOG_FUNCTION(this);
++    m_uv = CreateObject<UniformRandomVariable>();
++    m_rtrsEvent = Simulator::Schedule(m_startTime, &DualQCoupledPi2QueueDisc::DualPi2Update, this);
++}
++
++DualQCoupledPi2QueueDisc::~DualQCoupledPi2QueueDisc()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++void
++DualQCoupledPi2QueueDisc::DoDispose(void)
++{
++    NS_LOG_FUNCTION(this);
++    m_rtrsEvent.Cancel();
++    QueueDisc::DoDispose();
++}
++
++void
++DualQCoupledPi2QueueDisc::SetQueueLimit(uint32_t lim)
++{
++    NS_LOG_FUNCTION(this << lim);
++    m_queueLimit = lim;
++}
++
++uint32_t
++DualQCoupledPi2QueueDisc::GetQueueSize(void) const
++{
++    NS_LOG_FUNCTION(this);
++    return (GetInternalQueue(CLASSIC)->GetNBytes() + GetInternalQueue(L4S)->GetNBytes());
++}
++
++int64_t
++DualQCoupledPi2QueueDisc::AssignStreams(int64_t stream)
++{
++    NS_LOG_FUNCTION(this << stream);
++    m_uv->SetStream(stream);
++    return 1;
++}
++
++bool
++DualQCoupledPi2QueueDisc::IsL4S(Ptr<QueueDiscItem> item)
++{
++    uint8_t tosByte = 0;
++    if (item->GetUint8Value(QueueItem::IP_DSFIELD, tosByte))
++    {
++        // ECT(1) or CE
++        if ((tosByte & 0x3) == 1 || (tosByte & 0x3) == 3)
++        {
++            NS_LOG_DEBUG("L4S detected: " << static_cast<uint16_t>(tosByte & 0x3));
++            return true;
++        }
++    }
++    NS_LOG_DEBUG("Classic detected: " << static_cast<uint16_t>(tosByte & 0x3));
++    return false;
++}
++
++bool
++DualQCoupledPi2QueueDisc::DoEnqueue(Ptr<QueueDiscItem> item)
++{
++    NS_LOG_FUNCTION(this << item);
++    std::size_t queueNumber = CLASSIC;
++
++    uint32_t nQueued = GetQueueSize();
++    // in pseudocode, it compares to MTU, not packet size
++    if (nQueued + item->GetSize() > m_queueLimit)
++    {
++        // Drops due to queue limit
++        DropBeforeEnqueue(item, FORCED_DROP);
++        return false;
++    }
++    else
++    {
++        if (IsL4S(item))
++        {
++            queueNumber = L4S;
++        }
++    }
++
++    bool retval = GetInternalQueue(queueNumber)->Enqueue(item);
++    NS_LOG_LOGIC("Packets enqueued in queue-" << queueNumber << ": "
++                                              << GetInternalQueue(queueNumber)->GetNPackets());
++    return retval;
++}
++
++void
++DualQCoupledPi2QueueDisc::InitializeParams(void)
++{
++    if (m_mtu == 0)
++    {
++        Ptr<NetDeviceQueueInterface> ndqi = GetNetDeviceQueueInterface();
++        Ptr<NetDevice> dev;
++        // if the NetDeviceQueueInterface object is aggregated to a
++        // NetDevice, get the MTU of such NetDevice
++        if (ndqi && (dev = ndqi->GetObject<NetDevice>()))
++        {
++            m_mtu = dev->GetMtu();
++        }
++    }
++    NS_ABORT_MSG_IF(m_mtu < 68, "Error: MTU does not meet RFC 791 minimum");
++    m_thLen = 2 * m_mtu;
++    m_prevQ = Time(Seconds(0));
++    m_pCL = 0;
++    m_pC = 0;
++    m_pL = 0;
++}
++
++void
++DualQCoupledPi2QueueDisc::DualPi2Update()
++{
++    NS_LOG_FUNCTION(this);
++
++    // Use queuing time of first-in Classic packet
++    Ptr<const QueueDiscItem> item;
++    Time curQ = Seconds(0);
++
++    if ((item = GetInternalQueue(CLASSIC)->Peek()))
++    {
++        curQ = Simulator::Now() - item->GetTimeStamp();
++    }
++
++    m_baseProb = m_baseProb + m_alpha * (curQ - m_target).GetSeconds() +
++                 m_beta * (curQ - m_prevQ).GetSeconds();
++    // clamp p' to within [0,1]; page 34 of Internet-Draft
++    m_baseProb = std::max<double>(m_baseProb, 0);
++    m_baseProb = std::min<double>(m_baseProb, 1);
++    m_pCL = m_baseProb * m_k;
++    m_pCL = std::min<double>(m_pCL, 1);
++    m_pC = m_baseProb * m_baseProb;
++    m_prevQ = curQ;
++    m_rtrsEvent = Simulator::Schedule(m_tUpdate, &DualQCoupledPi2QueueDisc::DualPi2Update, this);
++}
++
++Ptr<QueueDiscItem>
++DualQCoupledPi2QueueDisc::DoDequeue()
++{
++    NS_LOG_FUNCTION(this);
++    Ptr<QueueDiscItem> item;
++    while (GetQueueSize() > 0)
++    {
++        if (Scheduler() == L4S)
++        {
++            item = GetInternalQueue(L4S)->Dequeue();
++            m_traceL4sSojourn(Simulator::Now() - item->GetTimeStamp());
++            double pPrimeL = 0;
++            if (GetInternalQueue(L4S)->GetNPackets() > 0)
++            {
++                pPrimeL = Laqm(Simulator::Now() - item->GetTimeStamp());
++            }
++            if (pPrimeL > m_pCL)
++            {
++                NS_LOG_DEBUG("Laqm probability " << std::min<double>(pPrimeL, 1)
++                                                 << " is driving p_L");
++            }
++            else
++            {
++                NS_LOG_DEBUG("coupled probability " << std::min<double>(m_pCL, 1)
++                                                    << " is driving p_L");
++            }
++            double pL = std::max<double>(pPrimeL, m_pCL);
++            pL = std::min<double>(pL, 1); // clamp p_L at 1
++            m_pL = pL;                    // Trace the value of p_L
++            if (Recur(pL))
++            {
++                bool retval = Mark(item, UNFORCED_L4S_MARK);
++                NS_ASSERT_MSG(retval == true, "Make sure we can mark in L4S queue");
++                NS_LOG_DEBUG("L-queue packet is marked");
++            }
++            else
++            {
++                NS_LOG_DEBUG("L-queue packet is not marked");
++            }
++            return item;
++        }
++        else
++        {
++            item = GetInternalQueue(CLASSIC)->Dequeue();
++            m_traceClassicSojourn(Simulator::Now() - item->GetTimeStamp());
++            // Heuristic in Linux code; never drop if less than 2 MTU in queue
++            if (GetInternalQueue(CLASSIC)->GetNBytes() < 2 * m_mtu)
++            {
++                return item;
++            }
++            if (m_pC > m_uv->GetValue())
++            {
++                if (!Mark(item, UNFORCED_CLASSIC_MARK))
++                {
++                    DropAfterDequeue(item, UNFORCED_CLASSIC_DROP);
++                    NS_LOG_DEBUG("C-queue packet is dropped");
++                    continue;
++                }
++                else
++                {
++                    NS_LOG_DEBUG("C-queue packet is marked");
++                    return item;
++                }
++            }
++            NS_LOG_DEBUG("C-queue packet is neither marked nor dropped");
++            return item;
++        }
++    }
++    return 0;
++}
++
++std::size_t
++DualQCoupledPi2QueueDisc::Scheduler() const
++{
++    NS_LOG_FUNCTION(this);
++    Time cqTime = Seconds(0);
++    Time lqTime = Seconds(0);
++    Ptr<const QueueDiscItem> peekedItem;
++    if ((peekedItem = GetInternalQueue(CLASSIC)->Peek()))
++    {
++        cqTime = Simulator::Now() - peekedItem->GetTimeStamp();
++    }
++    if ((peekedItem = GetInternalQueue(L4S)->Peek()))
++    {
++        lqTime = Simulator::Now() - peekedItem->GetTimeStamp();
++    }
++    NS_ASSERT_MSG(GetQueueSize() > 0, "Trying to schedule an empty queue");
++    // return 0 if classic, 1 if L4S
++    if (GetInternalQueue(L4S)->Peek() && ((lqTime + m_tShift) > cqTime))
++    {
++        return L4S;
++    }
++    else if (GetInternalQueue(CLASSIC)->Peek())
++    {
++        return CLASSIC;
++    }
++    else if (GetInternalQueue(L4S)->Peek())
++    {
++        NS_FATAL_ERROR("Should be unreachable");
++    }
++    return L4S;
++}
++
++double
++DualQCoupledPi2QueueDisc::Laqm(Time lqTime) const
++{
++    NS_LOG_FUNCTION(this << lqTime.GetSeconds());
++    if (lqTime > m_minTh)
++    {
++        return 1;
++    }
++    return 0;
++}
++
++bool
++DualQCoupledPi2QueueDisc::Recur(double likelihood)
++{
++    NS_LOG_FUNCTION(this << likelihood);
++    m_count += likelihood;
++    if (m_count > 1)
++    {
++        m_count -= 1;
++        return true;
++    }
++    return false;
++}
++
++Ptr<const QueueDiscItem>
++DualQCoupledPi2QueueDisc::DoPeek() const
++{
++    NS_LOG_FUNCTION(this);
++    Ptr<const QueueDiscItem> item;
++
++    for (std::size_t i = 0; i < GetNInternalQueues(); i++)
++    {
++        if ((item = GetInternalQueue(i)->Peek()))
++        {
++            NS_LOG_LOGIC("Peeked from queue number " << i << ": " << item);
++            NS_LOG_LOGIC("Number packets queue number " << i << ": "
++                                                        << GetInternalQueue(i)->GetNPackets());
++            NS_LOG_LOGIC("Number bytes queue number " << i << ": "
++                                                      << GetInternalQueue(i)->GetNBytes());
++            return item;
++        }
++    }
++
++    NS_LOG_LOGIC("Queue empty");
++    return item;
++}
++
++bool
++DualQCoupledPi2QueueDisc::CheckConfig(void)
++{
++    NS_LOG_FUNCTION(this);
++    if (GetNQueueDiscClasses() > 0)
++    {
++        NS_LOG_ERROR("DualQCoupledPi2QueueDisc cannot have classes");
++        return false;
++    }
++
++    if (GetNPacketFilters() > 0)
++    {
++        NS_LOG_ERROR("DualQCoupledPi2QueueDisc cannot have packet filters");
++        return false;
++    }
++
++    if (GetNInternalQueues() == 0)
++    {
++        // Create 2 DropTail queues
++        Ptr<InternalQueue> queue0 =
++            CreateObjectWithAttributes<DropTailQueue<QueueDiscItem>>("MaxSize",
++                                                                     QueueSizeValue(GetMaxSize()));
++        Ptr<InternalQueue> queue1 =
++            CreateObjectWithAttributes<DropTailQueue<QueueDiscItem>>("MaxSize",
++                                                                     QueueSizeValue(GetMaxSize()));
++        QueueSize queueSize(BYTES, m_queueLimit);
++        queue0->SetMaxSize(queueSize);
++        queue1->SetMaxSize(queueSize);
++        AddInternalQueue(queue0);
++        AddInternalQueue(queue1);
++    }
++
++    if (GetNInternalQueues() != 2)
++    {
++        NS_LOG_ERROR("DualQCoupledPi2QueueDisc needs 2 internal queue");
++        return false;
++    }
++
++    if (GetInternalQueue(CLASSIC)->GetMaxSize().GetValue() < m_queueLimit)
++    {
++        NS_LOG_ERROR(
++            "The size of the internal Classic traffic queue is less than the queue disc limit");
++        return false;
++    }
++
++    if (GetInternalQueue(L4S)->GetMaxSize().GetValue() < m_queueLimit)
++    {
++        NS_LOG_ERROR(
++            "The size of the internal L4S traffic queue is less than the queue disc limit");
++        return false;
++    }
++
++    return true;
++}
++
++} // namespace ns3
+diff --git a/src/traffic-control/model/dualq-coupled-pi2-queue-disc.h b/src/traffic-control/model/dualq-coupled-pi2-queue-disc.h
+new file mode 100644
+index 000000000..29a150e22
+--- /dev/null
++++ b/src/traffic-control/model/dualq-coupled-pi2-queue-disc.h
+@@ -0,0 +1,177 @@
++/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
++/*
++ * Copyright (c) 2017 NITK Surathkal
++ * Copyright (c) 2019 Tom Henderson (update to IETF draft -10)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation;
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ * Author: Shravya K.S. <shravya.ks0@gmail.com>
++ */
++
++#ifndef DUALQ_COUPLED_PI2_QUEUE_DISC_H
++#define DUALQ_COUPLED_PI2_QUEUE_DISC_H
++
++#include "ns3/boolean.h"
++#include "ns3/data-rate.h"
++#include "ns3/event-id.h"
++#include "ns3/nstime.h"
++#include "ns3/packet.h"
++#include "ns3/queue-disc.h"
++#include "ns3/random-variable-stream.h"
++#include "ns3/simulator.h"
++#include "ns3/string.h"
++#include "ns3/timer.h"
++#include "ns3/traced-value.h"
++
++#include <queue>
++
++namespace ns3
++{
++
++class UniformRandomVariable;
++
++/**
++ * \ingroup traffic-control
++ *
++ * Implements DualQ Coupled PI2 queue disc based on appendix A pseudocode
++ * from draft-ietf-tsvwg-aqm-dualq-coupled-10.txt.  The following differences
++ * exist with respect to what is specified in draft 10 appendix A:
++ * 1) a heuristic to avoid drops in C-queue if fewer than 2 MTU in the queue
++ */
++class DualQCoupledPi2QueueDisc : public QueueDisc
++{
++  public:
++    /**
++     * \brief Get the type ID.
++     * \return the object TypeId
++     */
++    static TypeId GetTypeId(void);
++    /**
++     * \brief Constructor
++     */
++    DualQCoupledPi2QueueDisc();
++    /**
++     * \brief  Destructor
++     */
++    virtual ~DualQCoupledPi2QueueDisc();
++    /**
++     * \brief Get the current value of the queue in bytes.
++     *
++     * \returns The queue size in bytes.
++     */
++    uint32_t GetQueueSize(void) const;
++    /**
++     * \brief Set the limit of the queue in bytes.
++     *
++     * \param lim The limit in bytes.
++     */
++    void SetQueueLimit(uint32_t lim);
++
++    // Reasons for dropping packets
++    static constexpr const char* UNFORCED_CLASSIC_DROP =
++        "Unforced drop in classic queue"; //!< Early probability drops: proactive
++    static constexpr const char* FORCED_DROP =
++        "Forced drop"; //!< Drops due to queue limit: reactive
++    static constexpr const char* UNFORCED_CLASSIC_MARK =
++        "Unforced classic mark"; //!< Unforced mark in classic queue
++    static constexpr const char* UNFORCED_L4S_MARK = "Unforced mark in L4S queue";
++
++    /**
++     * Assign a fixed random variable stream number to the random variables
++     * used by this model.  Return the number of streams (possibly zero) that
++     * have been assigned.
++     *
++     * \param stream first stream index to use
++     * \return the number of stream indices assigned by this model
++     */
++    int64_t AssignStreams(int64_t stream);
++
++  protected:
++    // Documented in base class
++    virtual void DoDispose(void);
++
++  private:
++    // Documented in base class
++    virtual bool DoEnqueue(Ptr<QueueDiscItem> item);
++    virtual Ptr<QueueDiscItem> DoDequeue(void);
++    virtual Ptr<const QueueDiscItem> DoPeek(void) const;
++    virtual bool CheckConfig(void);
++
++    /**
++     * \brief Initialize the queue parameters.
++     */
++    virtual void InitializeParams(void);
++    /**
++     * \brief check if traffic is classified as L4S (ECT(1) or CE)
++     * \param item the QueueDiscItem to check
++     * \return true if ECT(1) or CE, false otherwise
++     */
++    bool IsL4S(Ptr<QueueDiscItem> item);
++    /**
++     * \brief Implement the L4S recur function for probabilistic marking
++     * \param likelihood the likelihood of marking
++     * \return true if the queue should mark the packet
++     */
++    bool Recur(double likelihood);
++    /**
++     * \brief Periodically calculate the drop probability
++     */
++    void DualPi2Update(void);
++    /**
++     * L4S AQM function
++     * \param lqTime Delay to evaluate against threshold
++     * \return value between 0 and 1 representing the probability of mark
++     */
++    double Laqm(Time lqTime) const;
++    /**
++     * Simple time-shifted FIFO (TS-FIFO).  Must be at least one packet
++     * in the queue.
++     * \param lqTime L4S sojourn time
++     * \param cqTime Classic sojourn time
++     * \return either 0 (Classic) or 1 (L4S)
++     */
++    std::size_t Scheduler(void) const;
++
++    // Values supplied by user
++    Time m_target;         //!< Queue delay target for Classic traffic
++    Time m_tUpdate;        //!< Time period after which CalculateP () is called
++    Time m_tShift;         //!< Scheduler time bias
++    uint32_t m_mtu;        //!< Device MTU (bytes)
++    double m_alpha;        //!< Parameter to PI Square controller
++    double m_beta;         //!< Parameter to PI Square controller
++    Time m_minTh;          //!< L4S marking threshold (in time)
++    double m_k;            //!< Coupling factor
++    uint32_t m_queueLimit; //!< Queue limit in bytes / packets
++    Time m_startTime;      //!< Start time of the update timer
++
++    // Variables maintained by DualQ Coupled PI2
++    Time m_classicQueueTime;   //!< Arrival time of a packet of Classic Traffic
++    Time m_lqTime;             //!< Arrival time of a packet of L4S Traffic
++    uint32_t m_thLen;          //!< Minimum threshold (in bytes) for marking L4S traffic
++    double m_baseProb;         //!< Variable used in calculation of drop probability
++    TracedValue<double> m_pCL; //!< Coupled probability
++    TracedValue<double> m_pC;  //!< Classic drop/mark probability
++    TracedValue<double> m_pL;  //!< L4S mark probability
++    TracedCallback<Time> m_traceClassicSojourn; //!< Classic sojourn time
++    TracedCallback<Time> m_traceL4sSojourn;     //!< L4S sojourn time
++    Time m_prevQ;                               //!< Old value of queue delay
++    EventId m_rtrsEvent; //!< Event used to decide the decision of interval of drop probability
++                         //!< calculation
++    Ptr<UniformRandomVariable> m_uv; //!< Rng stream
++    double m_count{0};               //! Count for likelihood recur
++};
++
++} // namespace ns3
++
++#endif
+-- 
+2.34.1
+
+
+From 7dcf07ce10289e1808effb3c6ffa713db6d13adb Mon Sep 17 00:00:00 2001
+From: Eduarda Veras <eduarda.martins@gprt.ufpe.br>
+Date: Tue, 3 Feb 2026 16:35:53 -0300
+Subject: [PATCH 2/3] internet: Add Accurate ECN (AccEcn) support to TCP
+
+Implements AccEcn functionality including:
+- AE flag in TCP header
+- ACE field enconding/decoding
+- CE packet counters for sender and receiver
+- AccEcn processing logic in TcpSocketBase
+---
+ src/internet/model/tcp-header.cc      |  10 +-
+ src/internet/model/tcp-header.h       |  34 ++-
+ src/internet/model/tcp-socket-base.cc | 409 ++++++++++++++++++++++----
+ src/internet/model/tcp-socket-base.h  |  47 ++-
+ src/internet/model/tcp-socket-state.h |  10 +-
+ src/internet/test/tcp-general-test.cc |   2 +-
+ src/internet/test/tcp-general-test.h  |   2 +-
+ 7 files changed, 434 insertions(+), 80 deletions(-)
+
+diff --git a/src/internet/model/tcp-header.cc b/src/internet/model/tcp-header.cc
+index 70b035833..1c37654b3 100644
+--- a/src/internet/model/tcp-header.cc
++++ b/src/internet/model/tcp-header.cc
+@@ -25,11 +25,11 @@ NS_LOG_COMPONENT_DEFINE("TcpHeader");
+ NS_OBJECT_ENSURE_REGISTERED(TcpHeader);
+ 
+ std::string
+-TcpHeader::FlagsToString(uint8_t flags, const std::string& delimiter)
++TcpHeader::FlagsToString(uint16_t flags, const std::string& delimiter)
+ {
+-    static const char* flagNames[8] = {"FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"};
++    static const char* flagNames[9] = {"FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR", "AE"};
+     std::string flagsDescription = "";
+-    for (uint8_t i = 0; i < 8; ++i)
++    for (uint8_t i = 0; i < 9; ++i)
+     {
+         if (flags & (1 << i))
+         {
+@@ -74,7 +74,7 @@ TcpHeader::SetAckNumber(SequenceNumber32 ackNumber)
+ }
+ 
+ void
+-TcpHeader::SetFlags(uint8_t flags)
++TcpHeader::SetFlags(uint16_t flags)
+ {
+     m_flags = flags;
+ }
+@@ -133,7 +133,7 @@ TcpHeader::GetMaxOptionLength() const
+     return m_maxOptionsLen;
+ }
+ 
+-uint8_t
++uint16_t
+ TcpHeader::GetFlags() const
+ {
+     return m_flags;
+diff --git a/src/internet/model/tcp-header.h b/src/internet/model/tcp-header.h
+index 84bf111a6..4e7074694 100644
+--- a/src/internet/model/tcp-header.h
++++ b/src/internet/model/tcp-header.h
+@@ -52,16 +52,17 @@ class TcpHeader : public Header
+      * @param flags Bitfield of TCP flags to convert to a readable string
+      * @param delimiter String to insert between flags
+      *
+-     * FIN=0x1, SYN=0x2, RST=0x4, PSH=0x8, ACK=0x10, URG=0x20, ECE=0x40, CWR=0x80
++     * FIN=0x1, SYN=0x2, RST=0x4, PSH=0x8, ACK=0x10, URG=0x20, ECE=0x40, CWR=0x80,
++     * AE=0x100
+      * TcpHeader::FlagsToString (0x1) should return the following string;
+      *     "FIN"
+      *
+-     * TcpHeader::FlagsToString (0xff) should return the following string;
+-     *     "FIN|SYN|RST|PSH|ACK|URG|ECE|CWR";
++     * TcpHeader::FlagsToString (0x1ff) should return the following string;
++     *     "FIN|SYN|RST|PSH|ACK|URG|ECE|CWR|AE";
+      *
+      * @return the generated string
+      **/
+-    static std::string FlagsToString(uint8_t flags, const std::string& delimiter = "|");
++    static std::string FlagsToString(uint16_t flags, const std::string& delimiter = "|");
+ 
+     /**
+      * @brief Enable checksum calculation for TCP
+@@ -100,7 +101,7 @@ class TcpHeader : public Header
+      * @brief Set flags of the header
+      * @param flags the flags for this TcpHeader
+      */
+-    void SetFlags(uint8_t flags);
++    void SetFlags(uint16_t flags);
+ 
+     /**
+      * @brief Set the window size
+@@ -154,7 +155,7 @@ class TcpHeader : public Header
+      * @brief Get the flags
+      * @return the flags for this TcpHeader
+      */
+-    uint8_t GetFlags() const;
++    uint16_t GetFlags() const;
+ 
+     /**
+      * @brief Get the window size
+@@ -264,15 +265,16 @@ class TcpHeader : public Header
+      */
+     enum Flags_t
+     {
+-        NONE = 0, //!< No flags
+-        FIN = 1,  //!< FIN
+-        SYN = 2,  //!< SYN
+-        RST = 4,  //!< Reset
+-        PSH = 8,  //!< Push
+-        ACK = 16, //!< Ack
+-        URG = 32, //!< Urgent
+-        ECE = 64, //!< ECE
+-        CWR = 128 //!< CWR
++        NONE = 0,  //!< No flags
++        FIN = 1,   //!< FIN
++        SYN = 2,   //!< SYN
++        RST = 4,   //!< Reset
++        PSH = 8,   //!< Push
++        ACK = 16,  //!< Ack
++        URG = 32,  //!< Urgent
++        ECE = 64,  //!< ECE
++        CWR = 128, //!< CWR
++        AE = 256,  //!< AE
+     };
+ 
+     /**
+@@ -323,7 +325,7 @@ class TcpHeader : public Header
+     SequenceNumber32 m_sequenceNumber{0}; //!< Sequence number
+     SequenceNumber32 m_ackNumber{0};      //!< ACK number
+     uint8_t m_length{5};                  //!< Length (really a uint4_t) in words.
+-    uint8_t m_flags{0};                   //!< Flags (really a uint6_t)
++    uint16_t m_flags{0};                   //!< Flags (really a uint9_t)
+     uint16_t m_windowSize{0xffff};        //!< Window size
+     uint16_t m_urgentPointer{0};          //!< Urgent pointer
+ 
+diff --git a/src/internet/model/tcp-socket-base.cc b/src/internet/model/tcp-socket-base.cc
+index e0a91c793..f17461fa1 100644
+--- a/src/internet/model/tcp-socket-base.cc
++++ b/src/internet/model/tcp-socket-base.cc
+@@ -80,6 +80,15 @@ const std::map<std::pair<ns3::TcpSocketBase::TcpPacketType_t, ns3::TcpSocketStat
+         {{ns3::TcpSocketBase::RST, ns3::TcpSocketState::DctcpEcn}, true},
+         {{ns3::TcpSocketBase::RE_XMT, ns3::TcpSocketState::DctcpEcn}, true},
+         {{ns3::TcpSocketBase::DATA, ns3::TcpSocketState::DctcpEcn}, true},
++
++        {{ns3::TcpSocketBase::SYN, ns3::TcpSocketState::AccEcn}, true},
++        {{ns3::TcpSocketBase::SYN_ACK, ns3::TcpSocketState::AccEcn}, true},
++        {{ns3::TcpSocketBase::PURE_ACK, ns3::TcpSocketState::AccEcn}, true},
++        {{ns3::TcpSocketBase::WINDOW_PROBE, ns3::TcpSocketState::AccEcn}, true},
++        {{ns3::TcpSocketBase::FIN, ns3::TcpSocketState::AccEcn}, true},
++        {{ns3::TcpSocketBase::RST, ns3::TcpSocketState::AccEcn}, true},
++        {{ns3::TcpSocketBase::RE_XMT, ns3::TcpSocketState::AccEcn}, true},
++        {{ns3::TcpSocketBase::DATA, ns3::TcpSocketState::AccEcn}, true},
+     };
+ } // namespace
+ 
+@@ -1097,7 +1106,10 @@ TcpSocketBase::DoConnect()
+         // send a SYN packet with ECE and CWR flags set if sender is ECN capable
+         if (m_tcb->m_useEcn == TcpSocketState::On)
+         {
+-            SendEmptyPacket(TcpHeader::SYN | TcpHeader::ECE | TcpHeader::CWR);
++            if (m_tcb->m_ecnMode == TcpSocketState::AccEcn)
++                SendEmptyPacket(TcpHeader::SYN | TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE);
++            else
++                SendEmptyPacket(TcpHeader::SYN | TcpHeader::ECE | TcpHeader::CWR);
+         }
+         else
+         {
+@@ -1216,6 +1228,11 @@ TcpSocketBase::ForwardUp(Ptr<Packet> packet,
+     Address fromAddress = InetSocketAddress(header.GetSource(), port);
+     Address toAddress = InetSocketAddress(header.GetDestination(), m_endPoint->GetLocalPort());
+ 
++    //use ecn info to complete acc ecn negotiation
++    SocketIpTosTag tosTag;
++    tosTag.SetTos(header.GetTos());
++    packet->AddPacketTag(tosTag);
++
+     TcpHeader tcpHeader;
+     uint32_t bytesRemoved = packet->PeekHeader(tcpHeader);
+ 
+@@ -1229,10 +1246,14 @@ TcpSocketBase::ForwardUp(Ptr<Packet> packet,
+     if (header.GetEcn() == Ipv4Header::ECN_CE && m_ecnCESeq < tcpHeader.GetSequenceNumber())
+     {
+         NS_LOG_INFO("Received CE flag is valid");
+-        NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_CE_RCVD");
+         m_ecnCESeq = tcpHeader.GetSequenceNumber();
++        NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_CE_RCVD");
+         m_tcb->m_ecnState = TcpSocketState::ECN_CE_RCVD;
+-        m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE);
++        if (m_tcb->m_ecnMode == TcpSocketState::AccEcn)
++           m_tcb->m_rCep++;
++        else
++           m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE);
++
+     }
+     else if (header.GetEcn() != Ipv4Header::ECN_NotECT &&
+              m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED)
+@@ -1256,6 +1277,11 @@ TcpSocketBase::ForwardUp6(Ptr<Packet> packet,
+     Address fromAddress = Inet6SocketAddress(header.GetSource(), port);
+     Address toAddress = Inet6SocketAddress(header.GetDestination(), m_endPoint6->GetLocalPort());
+ 
++    //use ecn info to complete acc ecn negotiation
++    SocketIpv6TclassTag tclassTag;
++    tclassTag.SetTclass(header.GetTrafficClass());
++    packet->AddPacketTag(tclassTag);
++
+     TcpHeader tcpHeader;
+     uint32_t bytesRemoved = packet->PeekHeader(tcpHeader);
+ 
+@@ -1269,10 +1295,13 @@ TcpSocketBase::ForwardUp6(Ptr<Packet> packet,
+     if (header.GetEcn() == Ipv6Header::ECN_CE && m_ecnCESeq < tcpHeader.GetSequenceNumber())
+     {
+         NS_LOG_INFO("Received CE flag is valid");
+-        NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_CE_RCVD");
+         m_ecnCESeq = tcpHeader.GetSequenceNumber();
++        NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_CE_RCVD");
+         m_tcb->m_ecnState = TcpSocketState::ECN_CE_RCVD;
+-        m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE);
++        if (m_tcb->m_ecnMode == TcpSocketState::AccEcn)
++            m_tcb->m_rCep++;
++        else
++           m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE);
+     }
+     else if (header.GetEcn() != Ipv6Header::ECN_NotECT)
+     {
+@@ -1525,9 +1554,9 @@ TcpSocketBase::ProcessEstablished(Ptr<Packet> packet, const TcpHeader& tcpHeader
+ {
+     NS_LOG_FUNCTION(this << tcpHeader);
+ 
+-    // Extract the flags. PSH, URG, CWR and ECE are disregarded.
+-    uint8_t tcpflags =
+-        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE);
++    // Extract the flags. PSH, URG, CWR, ECE and AE are disregarded.
++    uint16_t tcpflags =
++        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE | TcpHeader::AE);
+ 
+     // Different flags are different events
+     if (tcpflags == TcpHeader::ACK)
+@@ -1889,6 +1918,30 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+         static_cast<uint32_t>(m_rateOps->GetConnectionRate().m_delivered - previousDelivered);
+     m_tcb->m_lastAckedSackedBytes = currentDelivered;
+ 
++    bool eceEvent = false;
++    if (m_tcb->m_ecnMode == TcpSocketState::AccEcn)
++    {
++        uint32_t segsAcked = (currentDelivered + m_tcb->m_segmentSize - 1) / m_tcb->m_segmentSize;
++        uint8_t ace = GetAceFlags(tcpHeader.GetFlags());
++
++        m_tcb->m_delivered += segsAcked;
++
++        uint32_t delta = ProcessAccEcn(segsAcked, ace);
++        if (delta > 0)
++        {
++            NS_LOG_INFO("Received Acc ECN, increment CE counter by " << delta);
++            eceEvent = true;
++        }
++    }
++    else
++    {
++        eceEvent = (m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED) &&
++                   (tcpHeader.GetFlags() & TcpHeader::ECE) &&
++                   (m_ecnEchoSeq < ackNumber);
++        NS_LOG_INFO("Received classic ECN Echo is "
++                     << (eceEvent ? "valid" : "not valid"));
++    }
++
+     if (m_tcb->m_congState == TcpSocketState::CA_CWR && (ackNumber > m_recover))
+     {
+         // Recovery is over after the window exceeds m_recover
+@@ -1903,23 +1956,34 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+         }
+     }
+ 
+-    if (ackNumber > oldHeadSequence && (m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED) &&
+-        (tcpHeader.GetFlags() & TcpHeader::ECE))
++    if (ackNumber > oldHeadSequence && eceEvent)
+     {
+-        if (m_ecnEchoSeq < ackNumber)
++        NS_LOG_INFO("Received ECN Echo is valid");
++        m_ecnEchoSeq = ackNumber;
++        NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_ECE_RCVD");
++        m_tcb->m_ecnState = TcpSocketState::ECN_ECE_RCVD;
++        if (m_tcb->m_ecnMode != TcpSocketState::AccEcn)
+         {
+-            NS_LOG_INFO("Received ECN Echo is valid");
+-            m_ecnEchoSeq = ackNumber;
+-            NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_ECE_RCVD");
+-            m_tcb->m_ecnState = TcpSocketState::ECN_ECE_RCVD;
+             if (m_tcb->m_congState != TcpSocketState::CA_CWR)
+             {
+                 EnterCwr(currentDelivered);
+             }
+         }
++        else
++        {
++            NS_LOG_INFO("Received Acc ECN is valid");
++            if (m_tcb->m_congState != TcpSocketState::CA_CWR)
++            {
++                m_congestionControl->CongestionStateSet(m_tcb, TcpSocketState::CA_CWR);
++                NS_LOG_DEBUG(TcpSocketState::TcpCongStateName[m_tcb->m_congState] << " -> CA_CWR");
++                m_tcb->m_congState = TcpSocketState::CA_CWR;
++                m_recover = m_tcb->m_highTxMark;
++            }
++        }
+     }
+     else if (m_tcb->m_ecnState == TcpSocketState::ECN_ECE_RCVD &&
+-             !(tcpHeader.GetFlags() & TcpHeader::ECE))
++             !(tcpHeader.GetFlags() & TcpHeader::ECE) &&
++             m_tcb->m_ecnMode != TcpSocketState::AccEcn)
+     {
+         m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
+     }
+@@ -2276,8 +2340,8 @@ TcpSocketBase::ProcessListen(Ptr<Packet> packet,
+     NS_LOG_FUNCTION(this << tcpHeader);
+ 
+     // Extract the flags. PSH, URG, CWR and ECE are disregarded.
+-    uint8_t tcpflags =
+-        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE);
++    uint16_t tcpflags =
++        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE | TcpHeader::AE);
+ 
+     // Fork a socket if received a SYN. Do nothing otherwise.
+     // C.f.: the LISTEN part in tcp_v4_do_rcv() in tcp_ipv4.c in Linux kernel
+@@ -2310,7 +2374,7 @@ TcpSocketBase::ProcessSynSent(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+     NS_LOG_FUNCTION(this << tcpHeader);
+ 
+     // Extract the flags. PSH and URG are disregarded.
+-    uint8_t tcpflags = tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG);
++    uint16_t tcpflags = tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG);
+ 
+     if (tcpflags == 0)
+     { // Bare data, accept it and move to ESTABLISHED state. This is not a normal behaviour. Remove
+@@ -2338,18 +2402,61 @@ TcpSocketBase::ProcessSynSent(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+          * the traffic is ECN capable and sender has sent ECN SYN packet
+          */
+ 
+-        if (m_tcb->m_useEcn != TcpSocketState::Off &&
+-            (tcpflags & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::CWR | TcpHeader::ECE))
++        if (m_tcb->m_useEcn != TcpSocketState::Off)
+         {
+-            NS_LOG_INFO("Received ECN SYN packet");
+-            SendEmptyPacket(TcpHeader::SYN | TcpHeader::ACK | TcpHeader::ECE);
+-            NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
+-            m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            if ((tcpHeader.GetFlags() & (TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE))
++            {
++                NS_LOG_DEBUG("Acc Ecn: Received SYN with AE|CWR|ECE flags.");
++
++                uint8_t ecnCodepoint = 0;
++                //check ip mark according to table 2 in draft...
++                SocketIpTosTag ipv4Tag;
++                SocketIpv6TclassTag ipv6Tag;
++                if (packet->RemovePacketTag(ipv4Tag))
++                    ecnCodepoint = ipv4Tag.GetTos() & 0x3;
++                else if (packet->RemovePacketTag(ipv6Tag))
++                    ecnCodepoint = ipv6Tag.GetTclass() & 0x3;
++
++                uint8_t responseFlags = TcpHeader::SYN | TcpHeader::ACK;
++
++                switch(ecnCodepoint)
++                {
++                    case 0x0:
++                    {
++                        responseFlags |= TcpHeader::CWR;
++                        break;
++                    }
++                    case 0x1:
++                    {
++                        responseFlags |= (TcpHeader::CWR | TcpHeader::ECE);
++                        break;
++                    }
++                    case 0x2:
++                    {
++                        responseFlags |= TcpHeader::AE;
++                        break;
++                    }
++                    case 0x3:
++                    {
++                        responseFlags |= (TcpHeader::AE | TcpHeader::CWR);
++                        break;
++                    }
++                }
++
++                SendEmptyPacket(responseFlags);
++                m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            }
++            else if ((tcpHeader.GetFlags() & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::CWR | TcpHeader::ECE))
++            {
++                SendEmptyPacket(TcpHeader::SYN | TcpHeader::ACK | TcpHeader::ECE);
++                NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
++                m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            }
+         }
+         else
+         {
+-            m_tcb->m_ecnState = TcpSocketState::ECN_DISABLED;
+             SendEmptyPacket(TcpHeader::SYN | TcpHeader::ACK);
++            m_tcb->m_ecnState = TcpSocketState::ECN_DISABLED;
+         }
+     }
+     else if (tcpflags & (TcpHeader::SYN | TcpHeader::ACK) &&
+@@ -2371,12 +2478,36 @@ TcpSocketBase::ProcessSynSent(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+         /* Check if we received an ECN SYN-ACK packet. Change the ECN state of sender to ECN_IDLE if
+          * receiver has sent an ECN SYN-ACK packet and the  traffic is ECN Capable
+          */
+-        if (m_tcb->m_useEcn != TcpSocketState::Off &&
+-            (tcpflags & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::ECE))
++        uint8_t receivedFlags = tcpHeader.GetFlags() & (TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE);
++        if (m_tcb->m_useEcn != TcpSocketState::Off)
+         {
+-            NS_LOG_INFO("Received ECN SYN-ACK packet.");
+-            NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
+-            m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            bool isAccEcn = false;
++            if (receivedFlags == (TcpHeader::CWR) ||
++                receivedFlags == (TcpHeader::CWR | TcpHeader::ECE) ||
++                receivedFlags == (TcpHeader::AE) ||
++                receivedFlags == (TcpHeader::AE | TcpHeader::CWR) ||
++                receivedFlags == (TcpHeader::AE | TcpHeader::ECE))
++            {
++                isAccEcn = true;
++            }
++
++            if (isAccEcn && m_tcb->m_ecnMode == TcpSocketState::AccEcn)
++            {
++                NS_LOG_DEBUG("Acc Ecn: successful negotiation.");
++                NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE (ACC)");
++                m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            }
++            else if (receivedFlags == TcpHeader::ECE)
++            {
++                NS_LOG_INFO("Received ECN SYN-ACK packet.");
++                NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
++                m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            }
++            else
++            {
++                NS_LOG_DEBUG("Ecn negotiation failed.");
++                m_tcb->m_ecnState = TcpSocketState::ECN_DISABLED;
++            }
+         }
+         else
+         {
+@@ -2410,9 +2541,9 @@ TcpSocketBase::ProcessSynRcvd(Ptr<Packet> packet,
+ {
+     NS_LOG_FUNCTION(this << tcpHeader);
+ 
+-    // Extract the flags. PSH, URG, CWR and ECE are disregarded.
+-    uint8_t tcpflags =
+-        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE);
++    // Extract the flags. PSH, URG, CWR, ECE and AE are disregarded.
++    uint16_t tcpflags =
++        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE | TcpHeader::AE);
+ 
+     if (tcpflags == 0 ||
+         (tcpflags == TcpHeader::ACK &&
+@@ -2457,14 +2588,56 @@ TcpSocketBase::ProcessSynRcvd(Ptr<Packet> packet,
+         /* Check if we received an ECN SYN packet. Change the ECN state of receiver to ECN_IDLE if
+          * sender has sent an ECN SYN packet and the  traffic is ECN Capable
+          */
+-        if (m_tcb->m_useEcn != TcpSocketState::Off &&
+-            (tcpHeader.GetFlags() & (TcpHeader::CWR | TcpHeader::ECE)) ==
+-                (TcpHeader::CWR | TcpHeader::ECE))
++        if (m_tcb->m_useEcn != TcpSocketState::Off)
+         {
+-            NS_LOG_INFO("Received ECN SYN packet");
+-            SendEmptyPacket(TcpHeader::SYN | TcpHeader::ACK | TcpHeader::ECE);
+-            NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
+-            m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            if ((tcpHeader.GetFlags() & (TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE))
++            {
++                NS_LOG_DEBUG("Acc Ecn: Received SYN with AE|CWR|ECE flags.");
++
++                uint8_t ecnCodepoint = 0;
++                //check ip mark according to table 2 in draft...
++                SocketIpTosTag ipv4Tag;
++                SocketIpv6TclassTag ipv6Tag;
++                if (packet->RemovePacketTag(ipv4Tag))
++                    ecnCodepoint = ipv4Tag.GetTos() & 0x3;
++                else if (packet->RemovePacketTag(ipv6Tag))
++                    ecnCodepoint = ipv6Tag.GetTclass() & 0x3;
++
++                uint8_t responseFlags = TcpHeader::SYN | TcpHeader::ACK;
++
++                switch(ecnCodepoint)
++                {
++                    case 0x0:
++                    {
++                        responseFlags |= TcpHeader::CWR;
++                        break;
++                    }
++                    case 0x1:
++                    {
++                        responseFlags |= (TcpHeader::CWR | TcpHeader::ECE);
++                        break;
++                    }
++                    case 0x2:
++                    {
++                        responseFlags |= TcpHeader::AE;
++                        break;
++                    }
++                    case 0x3:
++                    {
++                        responseFlags |= (TcpHeader::AE | TcpHeader::CWR);
++                        break;
++                    }
++                }
++
++                SendEmptyPacket(responseFlags);
++                m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            }
++            else if ((tcpHeader.GetFlags() & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::CWR | TcpHeader::ECE))
++            {
++                SendEmptyPacket(TcpHeader::SYN | TcpHeader::ACK | TcpHeader::ECE);
++                NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
++                m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++            }
+         }
+         else
+         {
+@@ -2522,9 +2695,9 @@ TcpSocketBase::ProcessWait(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+ {
+     NS_LOG_FUNCTION(this << tcpHeader);
+ 
+-    // Extract the flags. PSH, URG, CWR and ECE are disregarded.
+-    uint8_t tcpflags =
+-        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE);
++    // Extract the flags. PSH, URG, CWR, ECE and AE are disregarded.
++    uint16_t tcpflags =
++        tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE | TcpHeader::AE);
+ 
+     if (packet->GetSize() > 0 && !(tcpflags & TcpHeader::ACK))
+     { // Bare data, accept it
+@@ -2596,7 +2769,7 @@ TcpSocketBase::ProcessClosing(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+     NS_LOG_FUNCTION(this << tcpHeader);
+ 
+     // Extract the flags. PSH and URG are disregarded.
+-    uint8_t tcpflags = tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG);
++    uint16_t tcpflags = tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG);
+ 
+     if (tcpflags == TcpHeader::ACK)
+     {
+@@ -2629,7 +2802,7 @@ TcpSocketBase::ProcessLastAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
+     NS_LOG_FUNCTION(this << tcpHeader);
+ 
+     // Extract the flags. PSH and URG are disregarded.
+-    uint8_t tcpflags = tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG);
++    uint16_t tcpflags = tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG);
+ 
+     if (tcpflags == 0)
+     {
+@@ -2772,7 +2945,7 @@ TcpSocketBase::Destroy6()
+ 
+ /* Send an empty packet with specified TCP flags */
+ void
+-TcpSocketBase::SendEmptyPacket(uint8_t flags)
++TcpSocketBase::SendEmptyPacket(uint16_t flags)
+ {
+     NS_LOG_FUNCTION(this << static_cast<uint32_t>(flags));
+ 
+@@ -2808,6 +2981,12 @@ TcpSocketBase::SendEmptyPacket(uint8_t flags)
+     else if (flags & TcpHeader::ACK)
+     {
+         packetType = TcpPacketType_t::PURE_ACK;
++        if (m_tcb->m_ecnMode == TcpSocketState::AccEcn)
++        {
++            flags &= ~(TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE);
++            uint8_t ace = EncodeAceFlag(m_tcb->m_rCep);
++            flags |= SetAceFlags(ace);
++        }
+     }
+ 
+     if (flags & TcpHeader::RST)
+@@ -2988,6 +3167,9 @@ TcpSocketBase::SetupEndpoint()
+         m_errno = errno_;
+         return -1;
+     }
++    Ptr<NetDevice> outDev = route->GetOutputDevice();
++    if (outDev)
++        m_tcb->m_mtu = outDev->GetMtu();
+     NS_LOG_LOGIC("Route exists");
+     m_endPoint->SetLocalAddress(route->GetSource());
+     return 0;
+@@ -3018,6 +3200,9 @@ TcpSocketBase::SetupEndpoint6()
+         m_errno = errno_;
+         return -1;
+     }
++    Ptr<NetDevice> outDev = route->GetOutputDevice();
++    if (outDev)
++        m_tcb->m_mtu = outDev->GetMtu();
+     NS_LOG_LOGIC("Route exists");
+     m_endPoint6->SetLocalAddress(route->GetSource());
+     return 0;
+@@ -3054,6 +3239,35 @@ TcpSocketBase::CompleteFork(Ptr<Packet> p [[maybe_unused]],
+     }
+     m_tcp->AddSocket(this);
+ 
++    if (m_endPoint)
++    {
++        Ptr<Ipv4> ipv4 = m_node->GetObject<Ipv4>();
++        NS_ASSERT(ipv4);
++        int32_t interface = ipv4->GetInterfaceForAddress(m_endPoint->GetLocalAddress());
++        if (interface != -1)
++        {
++            Ptr<NetDevice> outDev = ipv4->GetNetDevice(interface);
++            if (outDev)
++            {
++                m_tcb->m_mtu = outDev->GetMtu();
++            }
++        }
++    }
++    else if (m_endPoint6)
++    {
++        Ptr<Ipv6L3Protocol> ipv6 = m_node->GetObject<Ipv6L3Protocol>();
++        NS_ASSERT(ipv6);
++        int32_t interface = ipv6->GetInterfaceForAddress(m_endPoint6->GetLocalAddress());
++        if (interface != -1)
++        {
++            Ptr<NetDevice> outDev = ipv6->GetNetDevice(interface);
++            if (outDev)
++            {
++                m_tcb->m_mtu = outDev->GetMtu();
++            }
++        }
++    }
++
+     // Change the cloned socket from LISTEN state to SYN_RCVD
+     NS_LOG_DEBUG("LISTEN -> SYN_RCVD");
+     m_state = SYN_RCVD;
+@@ -3066,12 +3280,56 @@ TcpSocketBase::CompleteFork(Ptr<Packet> p [[maybe_unused]],
+     /* Check if we received an ECN SYN packet. Change the ECN state of receiver to ECN_IDLE if
+      * sender has sent an ECN SYN packet and the traffic is ECN Capable
+      */
+-    if (m_tcb->m_useEcn != TcpSocketState::Off &&
+-        (h.GetFlags() & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::CWR | TcpHeader::ECE))
++    if (m_tcb->m_useEcn != TcpSocketState::Off)
+     {
+-        SendEmptyPacket(TcpHeader::SYN | TcpHeader::ACK | TcpHeader::ECE);
+-        NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
+-        m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++        if ((h.GetFlags() & (TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE))
++        {
++            NS_LOG_DEBUG("Acc Ecn: Received SYN with AE|CWR|ECE flags.");
++
++            uint8_t ecnCodepoint = 0;
++            //check ip mark according to table 2 in draft...
++            SocketIpTosTag ipv4Tag;
++            SocketIpv6TclassTag ipv6Tag;
++            if (p->RemovePacketTag(ipv4Tag))
++                ecnCodepoint = ipv4Tag.GetTos() & 0x3;
++            else if (p->RemovePacketTag(ipv6Tag))
++                ecnCodepoint = ipv6Tag.GetTclass() & 0x3;
++
++            uint8_t responseFlags = TcpHeader::SYN | TcpHeader::ACK;
++
++            switch(ecnCodepoint)
++            {
++                case 0x0:
++                {
++                    responseFlags |= TcpHeader::CWR;
++                    break;
++                }
++                case 0x1:
++                {
++                    responseFlags |= (TcpHeader::CWR | TcpHeader::ECE);
++                    break;
++                }
++                case 0x2:
++                {
++                    responseFlags |= TcpHeader::AE;
++                    break;
++                }
++                case 0x3:
++                {
++                    responseFlags |= (TcpHeader::AE | TcpHeader::CWR);
++                    break;
++                }
++            }
++
++            SendEmptyPacket(responseFlags);
++            m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++        }
++        else if ((h.GetFlags() & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::CWR | TcpHeader::ECE))
++        {
++            SendEmptyPacket(TcpHeader::SYN | TcpHeader::ACK | TcpHeader::ECE);
++            NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_IDLE");
++            m_tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++        }
+     }
+     else
+     {
+@@ -3192,7 +3450,7 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
+     bool isRetransmission = outItem->IsRetrans();
+     Ptr<Packet> p = outItem->GetPacketCopy();
+     uint32_t sz = p->GetSize(); // Size of packet
+-    uint8_t flags = withAck ? TcpHeader::ACK : 0;
++    uint16_t flags = withAck ? TcpHeader::ACK : 0;
+     uint32_t remainingData = m_txBuffer->SizeFromSequence(seq + SequenceNumber32(sz));
+ 
+     // TCP sender should not send data out of the window advertised by the
+@@ -3222,6 +3480,12 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
+ 
+     if (withAck)
+     {
++        if (m_tcb->m_ecnMode == TcpSocketState::AccEcn)
++        {
++            flags &= ~(TcpHeader::AE | TcpHeader::CWR | TcpHeader::ECE);
++            uint8_t ace = EncodeAceFlag(m_tcb->m_rCep);
++            flags |= SetAceFlags(ace);
++        }
+         m_delAckEvent.Cancel();
+         m_delAckCount = 0;
+     }
+@@ -3232,8 +3496,11 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
+         NS_LOG_DEBUG(TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_CWR_SENT");
+         m_tcb->m_ecnState = TcpSocketState::ECN_CWR_SENT;
+         m_ecnCWRSeq = seq;
+-        flags |= TcpHeader::CWR;
+-        NS_LOG_INFO("CWR flags set");
++        if (m_tcb->m_ecnMode != TcpSocketState::AccEcn)
++        {
++            flags |= TcpHeader::CWR;
++            NS_LOG_INFO("CWR flags set");
++        }
+     }
+ 
+     bool isEct = IsEct(isRetransmission ? TcpPacketType_t::RE_XMT : TcpPacketType_t::DATA);
+@@ -4806,6 +5073,38 @@ TcpSocketBase::SetUseEcn(TcpSocketState::UseEcn_t useEcn)
+     m_tcb->m_useEcn = useEcn;
+ }
+ 
++uint32_t
++TcpSocketBase::ProcessAccEcn(uint32_t segsAcked, uint8_t ace)
++{
++    NS_LOG_FUNCTION(this << segsAcked << (uint32_t) ace);
++
++    uint32_t delta = (ace - (m_tcb->m_sCep & 0x07)) & 0x07;
++
++    if (segsAcked > 7)
++    {
++        uint32_t safeDelta = segsAcked - ((segsAcked - delta) & 0x07);
++        if (safeDelta != delta)
++        {
++            delta = safeDelta;
++            NS_LOG_WARN("ACE wrap-around detected, adjusted delta to " << delta);
++        }
++    }
++
++    if (delta > 0)
++    {
++        m_tcb->m_sCep += delta;
++        m_tcb->m_delta = delta;
++        m_tcb->m_deliveredCe += delta;
++        NS_LOG_INFO("Acc Ecn processed, delta=" << delta << ", sCep=" << (uint32_t)m_tcb->m_sCep);
++    }
++    else
++    {
++        m_tcb->m_delta = 0;
++    }
++
++    return delta;
++}
++
+ uint32_t
+ TcpSocketBase::GetRWnd() const
+ {
+diff --git a/src/internet/model/tcp-socket-base.h b/src/internet/model/tcp-socket-base.h
+index 7d6b6c392..f72c2c18b 100644
+--- a/src/internet/model/tcp-socket-base.h
++++ b/src/internet/model/tcp-socket-base.h
+@@ -580,6 +580,51 @@ class TcpSocketBase : public TcpSocket
+      */
+     void SetUseEcn(TcpSocketState::UseEcn_t useEcn);
+ 
++    /**
++     * @brief Process Accurate ECN feedback from the receiver
++     *
++     * @param segsAcked Number of segments acknowledged by the received ACK
++     * @param ace ACE field value from receiver
++     *
++     * @return Number of CE packets to be considered for congestion control
++     */
++    uint32_t ProcessAccEcn(uint32_t segsAcked, uint8_t ace);
++
++    /**
++     * @brief Set ACE field
++     *
++     * @param ace ACE field value to set
++     */
++    inline uint16_t SetAceFlags(uint16_t ace) const
++    {
++        uint16_t aceValue = static_cast<uint16_t>(ace & 0x7);
++        return (aceValue << 6);
++    }
++
++    /**
++     * @brief Get ACE field from flags
++     *
++     * @param flags TCP header flags
++     *
++     * @return ACE field value
++     */
++    inline uint8_t GetAceFlags(uint16_t flags) const
++    {
++        return ((flags >> 6) & 0x7);
++    }
++
++    /**
++     * @brief Encode ACE field for Accurate ECN
++     *
++     * @param rCep CE packet counter at receiver
++     *
++     * @return Encoded ACE field value
++     */
++    inline uint8_t EncodeAceFlag(uint32_t rCep) const
++    {
++        return rCep % 8;
++    }
++
+     /**
+      * @brief Enable or disable pacing
+      * @param pacing Boolean to enable or disable pacing
+@@ -858,7 +903,7 @@ class TcpSocketBase : public TcpSocket
+      *
+      * @param flags the packet's flags
+      */
+-    virtual void SendEmptyPacket(uint8_t flags);
++    virtual void SendEmptyPacket(uint16_t flags);
+ 
+     /**
+      * @brief Send reset and tear down this socket
+diff --git a/src/internet/model/tcp-socket-state.h b/src/internet/model/tcp-socket-state.h
+index 9655bd9e1..c3a82b6e2 100644
+--- a/src/internet/model/tcp-socket-state.h
++++ b/src/internet/model/tcp-socket-state.h
+@@ -128,6 +128,7 @@ class TcpSocketState : public Object
+         ClassicEcn, //!< ECN functionality as described in RFC 3168.
+         DctcpEcn,   //!< ECN functionality as described in RFC 8257. Note: this mode is specific to
+                     //!< DCTCP.
++        AccEcn,     //!< AccECN functionality
+     };
+ 
+     /**
+@@ -172,6 +173,7 @@ class TcpSocketState : public Object
+ 
+     // Segment
+     uint32_t m_segmentSize{0};          //!< Segment size
++    uint32_t m_mtu{0};                  //!< Maximum Transmission Unit
+     SequenceNumber32 m_lastAckedSeq{0}; //!< Last sequence ACKed
+ 
+     TracedValue<TcpCongState_t> m_congState{CA_OPEN}; //!< State in the Congestion state machine
+@@ -208,6 +210,12 @@ class TcpSocketState : public Object
+ 
+     EcnCodePoint_t m_ectCodePoint{Ect0}; //!< ECT code point to use
+ 
++    uint32_t m_rCep{5};         //!< ce packet counter at the receiver
++    uint32_t m_sCep{5};         //!< ce packet counter at the sender
++    uint32_t m_delta{0};        //!< ce packet since last ACK
++    uint32_t m_deliveredCe{0};  //!< total ce packets delivered
++    uint32_t m_delivered{0};    //!< total packets delivered
++
+     uint32_t m_lastAckedSackedBytes{
+         0}; //!< The number of bytes acked and sacked as indicated by the current ACK received. This
+             //!< is similar to acked_sacked variable in Linux
+@@ -235,7 +243,7 @@ class TcpSocketState : public Object
+     /**
+      * Callback to send an empty packet
+      */
+-    Callback<void, uint8_t> m_sendEmptyPacketCallback;
++    Callback<void, uint16_t> m_sendEmptyPacketCallback;
+ };
+ 
+ namespace TracedValueCallback
+diff --git a/src/internet/test/tcp-general-test.cc b/src/internet/test/tcp-general-test.cc
+index b364ef4fc..a50f02f3b 100644
+--- a/src/internet/test/tcp-general-test.cc
++++ b/src/internet/test/tcp-general-test.cc
+@@ -1160,7 +1160,7 @@ TcpSocketSmallAcks::GetTypeId()
+  * we are forced to do this.
+  */
+ void
+-TcpSocketSmallAcks::SendEmptyPacket(uint8_t flags)
++TcpSocketSmallAcks::SendEmptyPacket(uint16_t flags)
+ {
+     Ptr<Packet> p = Create<Packet>();
+     TcpHeader header;
+diff --git a/src/internet/test/tcp-general-test.h b/src/internet/test/tcp-general-test.h
+index b8fecd903..4a98760be 100644
+--- a/src/internet/test/tcp-general-test.h
++++ b/src/internet/test/tcp-general-test.h
+@@ -192,7 +192,7 @@ class TcpSocketSmallAcks : public TcpSocketMsgBase
+     }
+ 
+   protected:
+-    void SendEmptyPacket(uint8_t flags) override;
++    void SendEmptyPacket(uint16_t flags) override;
+     Ptr<TcpSocketBase> Fork() override;
+ 
+     uint32_t m_bytesToAck;           //!< Number of bytes to be ACKed.
+-- 
+2.34.1
+
+
+From 75a218f8b655c14d785e22e7bac39c093f80b8ac Mon Sep 17 00:00:00 2001
+From: Eduarda Veras <eduarda.martins@gprt.ufpe.br>
+Date: Tue, 3 Feb 2026 16:36:13 -0300
+Subject: [PATCH 3/3] internet: Add TCP Prague congestion control
+
+Implements L4S-compatible TCP Prague with AccEcn support,
+RTT independence and dynamic pacing. Algorithm is aligned
+with Linux kernel implementation.
+---
+ src/internet/CMakeLists.txt      |   2 +
+ src/internet/model/tcp-prague.cc | 844 +++++++++++++++++++++++++++++++
+ src/internet/model/tcp-prague.h  | 255 ++++++++++
+ 3 files changed, 1101 insertions(+)
+ create mode 100644 src/internet/model/tcp-prague.cc
+ create mode 100644 src/internet/model/tcp-prague.h
+
+diff --git a/src/internet/CMakeLists.txt b/src/internet/CMakeLists.txt
+index a105dcd2d..d56a1cec1 100644
+--- a/src/internet/CMakeLists.txt
++++ b/src/internet/CMakeLists.txt
+@@ -104,6 +104,7 @@ set(source_files
+     model/tcp-option-ts.cc
+     model/tcp-option-winscale.cc
+     model/tcp-option.cc
++    model/tcp-prague.cc
+     model/tcp-prr-recovery.cc
+     model/tcp-rate-ops.cc
+     model/tcp-recovery-ops.cc
+@@ -229,6 +230,7 @@ set(header_files
+     model/tcp-option-ts.h
+     model/tcp-option-winscale.h
+     model/tcp-option.h
++    model/tcp-prague.h
+     model/tcp-prr-recovery.h
+     model/tcp-rate-ops.h
+     model/tcp-recovery-ops.h
+diff --git a/src/internet/model/tcp-prague.cc b/src/internet/model/tcp-prague.cc
+new file mode 100644
+index 000000000..bc9e5f15d
+--- /dev/null
++++ b/src/internet/model/tcp-prague.cc
+@@ -0,0 +1,844 @@
++/*
++ * Copyright (c) 2026 GPRT
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Author: Maria Eduarda Veras <maria.martins@gprt.ufpe.br>
++ *
++ */
++
++#include "tcp-prague.h"
++
++#include "math.h"
++#include "tcp-socket-state.h"
++
++#include "ns3/log.h"
++#include "ns3/simulator.h"
++#include "ns3/trace-source-accessor.h"
++
++namespace ns3
++{
++
++NS_LOG_COMPONENT_DEFINE("TcpPrague");
++
++NS_OBJECT_ENSURE_REGISTERED(TcpPrague);
++
++TypeId
++TcpPrague::GetTypeId()
++{
++    static TypeId tid =
++        TypeId("ns3::TcpPrague")
++            .SetParent<TcpCongestionOps>()
++            .AddConstructor<TcpPrague>()
++            .SetGroupName("Internet")
++            .AddAttribute("Gain",
++                          "Parameter g (EWMA gain) for updating alpha",
++                          DoubleValue(0.0625),
++                          MakeDoubleAccessor(&TcpPrague::m_g),
++                          MakeDoubleChecker<double>(0, 1))
++            .AddAttribute("AlphaMode",
++                          "TCP Prague SS mode (0: Half cwnd at 1st mark; 1: Init 1)",
++                          BooleanValue(false),
++                          MakeBooleanAccessor(&TcpPrague::m_alphaMode),
++                          MakeBooleanChecker())
++            .AddAttribute("RateOffset",
++                          "Pacing rate offset to be added to the calculated pacing rate",
++                          DoubleValue(0.03125),
++                          MakeDoubleAccessor(&TcpPrague::m_pacingOffset),
++                          MakeDoubleChecker<double>())
++            .AddAttribute("PragueCwndMode",
++                          "TCP Prague mode (0: FracWin; 1: Rate-base; 2: Switch)",
++                          IntegerValue(2),
++                          MakeIntegerAccessor(&TcpPrague::m_pragueCwndMode),
++                          MakeIntegerChecker<int>(0, 2))
++            .AddAttribute("CwndTransit",
++                          "CWND mode switching point in terms of segments",
++                          UintegerValue(4),
++                          MakeUintegerAccessor(&TcpPrague::m_cwndTransit),
++                          MakeUintegerChecker<uint32_t>())
++            .AddAttribute("EcnFallback",
++                          "Ecn fallback mode (0 = none, 1 = detection & fallback, 2 = detection)",
++                          IntegerValue(0),
++                          MakeIntegerAccessor(&TcpPrague::m_ecnFallback),
++                          MakeIntegerChecker<int>())
++            .AddAttribute("RttTarget",
++                          "Rtt target",
++                          TimeValue(MilliSeconds(25)),
++                          MakeTimeAccessor(&TcpPrague::m_rttTarget),
++                          MakeTimeChecker())
++            .AddAttribute(
++                "RttTransitionDelay",
++                "Number of rounds post Slow Start after which RTT independence is enabled",
++                UintegerValue(4),
++                MakeUintegerAccessor(&TcpPrague::m_rttTransitionDelay),
++                MakeUintegerChecker<uint32_t>())
++            .AddTraceSource("Alpha",
++                            "Value of TCP Prague alpha variable",
++                            MakeTraceSourceAccessor(&TcpPrague::m_alpha),
++                            "ns3::TracedValueCallback::Double");
++    return tid;
++}
++
++std::string
++TcpPrague::GetName() const
++{
++    return "TcpPrague";
++}
++
++TcpPrague::TcpPrague()
++    : TcpCongestionOps()
++{
++    NS_LOG_FUNCTION(this);
++    m_oldDelivered = 0;
++    m_oldDeliveredCe = 0;
++    m_priorRcvNxt = SequenceNumber32(0);
++    m_priorRcvNxtFlag = false;
++    m_nextSeq = SequenceNumber32(0);
++    m_nextSeqFlag = false;
++    m_ceState = false;
++    m_delayedAckReserved = false;
++
++
++}
++
++TcpPrague::TcpPrague(const TcpPrague& sock)
++    : TcpCongestionOps(sock),
++      m_priorRcvNxt(sock.m_priorRcvNxt),
++      m_priorRcvNxtFlag(sock.m_priorRcvNxtFlag),
++      m_alpha(sock.m_alpha),
++      m_nextSeq(sock.m_nextSeq),
++      m_nextSeqFlag(sock.m_nextSeqFlag),
++      m_ceState(sock.m_ceState),
++      m_delayedAckReserved(sock.m_delayedAckReserved),
++      m_g(sock.m_g),
++      m_rttTarget(sock.m_rttTarget)
++{
++    NS_LOG_FUNCTION(this);
++}
++
++TcpPrague::~TcpPrague()
++{
++    NS_LOG_FUNCTION(this);
++}
++
++Ptr<TcpCongestionOps>
++TcpPrague::Fork()
++{
++    NS_LOG_FUNCTION(this);
++    return CopyObject<TcpPrague>(this);
++}
++
++void
++TcpPrague::Init(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    NS_LOG_INFO(this << " Enabling AccEcn for TCP Prague");
++    tcb->m_useEcn = TcpSocketState::On;
++    tcb->m_ecnMode = TcpSocketState::AccEcn;
++    tcb->m_ectCodePoint = TcpSocketState::Ect1;
++
++    // fallack to Reno on ECN misdetection (to-do)
++
++    m_alphaStamp = Simulator::Now();
++    if (!m_alphaMode)
++        m_alpha = 0.0;
++    else
++        m_alpha = 1.0;
++
++    // Use initialCWnd if cWnd is not yet initialized (client side before handshake)
++    uint32_t cwnd = tcb->m_cWnd.Get() > 0 ? tcb->m_cWnd.Get() : tcb->m_initialCWnd * tcb->m_segmentSize;
++    m_fracCwnd = static_cast<double>(cwnd);
++
++    NS_LOG_DEBUG("tcp srtt: " << tcb->m_srtt.Get());
++    if (!tcb->m_srtt.Get().IsZero())
++    {
++        double initialRate =
++            (tcb->m_mtu * 8.0) / tcb->m_srtt.Get().GetSeconds(); // in bps
++        uint32_t packets = std::max(cwnd, tcb->m_bytesInFlight.Get()) / tcb->m_segmentSize; // in segments
++        double finalRate = initialRate * packets;
++        m_pacingRate = DataRate(std::max((uint64_t)finalRate, DataRate("100kbps").GetBitRate()));
++        NS_LOG_DEBUG("Pacing rate initialized to: " << m_pacingRate);
++    }
++    else
++    {
++        m_pacingRate = DataRate("100kbps");
++        NS_LOG_DEBUG("Pacing rate initialized to minimum: " << m_pacingRate);
++    }
++    UpdatePacingRate(tcb);
++
++    tcb->m_pacing = true;
++    tcb->m_paceInitialWindow = true;
++
++    m_lossPacingRate = DataRate(0); // initially zero
++    m_round = 0;
++    m_sawCE = (tcb->m_deliveredCe > 0);
++
++    //mtu cache (to-do)
++    if (!tcb->m_srtt.Get().IsZero())
++        m_hsrtt = tcb->m_srtt.Get();
++    else
++        m_hsrtt = MicroSeconds(1); //initial 1us
++
++    m_cwndModeTransit = (m_pragueCwndMode & 0x02) != 0;
++    m_cwndMode = (m_pragueCwndMode & 0x01) != 0;
++
++    NewRound(tcb);
++}
++
++bool
++TcpPrague::HasCongControl() const
++{
++    NS_LOG_FUNCTION(this);
++    return true;
++}
++
++void
++TcpPrague::CongControl(Ptr<TcpSocketState> tcb,
++                       const TcpRateOps::TcpRateConnection& rc,
++                       const TcpRateOps::TcpRateSample& rs)
++{
++    NS_LOG_FUNCTION(this << tcb << rs);
++
++    UpdateCwnd(tcb, rs);
++
++    if (ShouldUpdateEwma(tcb))
++        UpdateAlpha(tcb);
++
++    UpdatePacingRate(tcb);
++
++    if (m_cwndModeTransit)
++    {
++        uint32_t cwndPackets = tcb->m_cWnd / tcb->m_segmentSize;
++        uint32_t cwndBytes = cwndPackets * tcb->m_mtu;
++        uint32_t cwndBytesTransit = m_cwndTransit * 1500; // MTU SYS is 1500 bytes
++
++        if (m_sawCE && cwndBytes <= cwndBytesTransit)
++        {
++            m_cwndMode = 1;
++            m_fracCwnd = PacingRateToFracCwnd(tcb);
++            NS_LOG_DEBUG("Switching to Rate-based cwnd mode");
++        }
++        else if (!m_sawCE || cwndBytes > cwndBytesTransit)
++        {
++            m_cwndMode = 0;
++            m_pacingRate = FracCwndToPacingRate(tcb);
++            NS_LOG_DEBUG("Switching to FracWin cwnd mode");
++        }
++    }
++    else if (!m_sawCE)
++    {
++        m_cwndMode = 0;
++    }
++}
++
++Time
++TcpPrague::GetVirtualRtt(Ptr<TcpSocketState> tcb) const
++{
++    return std::max(m_rttTarget, tcb->m_srtt.Get());
++}
++
++uint32_t
++TcpPrague::FracCwndToBytes(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    /*
++     * Linux Logic Translation:
++     * Linux maintains cwnd in packets and rounds up fractional parts to allow
++     * immediate transmission of partial packets.
++     * E.g., 2.1 pkts -> 3 pkts.
++     *
++     * In ns-3 (bytes), doing simple rounding could block the transmission
++     * of that partial 3rd packet until the window grows to full 3*MSS.
++     *
++     * To match Linux aggressiveness:
++     * 1. Convert bytes to fractional segments.
++     * 2. Use ceil() to round UP to the next full segment.
++     * 3. Convert back to bytes.
++     */
++
++    uint32_t cwndSegs = static_cast<uint32_t>(std::ceil(m_fracCwnd / tcb->m_segmentSize));
++    uint32_t minBytes = 2 * tcb->m_segmentSize;
++    uint32_t cwndBytes = cwndSegs * tcb->m_segmentSize;
++    uint32_t cwnd = std::max(cwndBytes, minBytes);
++
++    return cwnd;
++}
++
++double_t
++TcpPrague::PacingRateToFracCwnd(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    Time rtt = m_hsrtt > Time(0) ? m_hsrtt : tcb->m_srtt.Get();
++
++    return static_cast<double_t>(m_pacingRate.GetBitRate()) * rtt.GetSeconds() / 8.0;
++}
++
++DataRate
++TcpPrague::FracCwndToPacingRate(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    /* * Linux logic translation:
++     * 1. Calculate base rate: Linux calculates the bits of 1 MTU sent in 1us.
++     * Equation: (USEC_PER_SEC << 3) * mtu
++     * In ns-3: (MTU * 8 bits) * 1,000,000 (to scale from us to sec)
++     */
++    double rate = (tcb->m_mtu * 8.0) * 1000000.0;
++
++    if (!tcb->m_srtt.Get().IsZero())
++    {
++        rate = rate / tcb->m_srtt.Get().GetMicroSeconds();
++    }
++
++    /*
++     * 3. Window Scaling:
++     * Linux: mul_u64_u64_shr(rate, ca->frac_cwnd, CWND_UNIT)
++     * Linux stores frac_cwnd in PACKETS. So it effectively does:
++     * Rate_for_1_Packet * Num_Packets_in_Window.
++     *
++     * ns-3: Our m_fracCwnd is in BYTES.
++     * To match Linux structure (pacing based on MTU overhead but window based on MSS),
++     * we divide m_fracCwnd by segmentSize to get the number of packets.
++     */
++    rate = rate * (m_fracCwnd / tcb->m_segmentSize);
++    rate = std::max((uint64_t)rate, DataRate("100kbps").GetBitRate());
++
++    return DataRate(static_cast<uint64_t>(rate));
++}
++
++void
++TcpPrague::UpdatePacingRate(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this);
++
++    uint64_t offset, rate;
++    uint32_t maxFlight, mtu;
++
++    bool halfVirtualRttElapsed =
++        (GetVirtualRtt(tcb) / 2.0) <= Simulator::Now() - m_alphaStamp;
++
++    if (IsRttIndependent(tcb) && m_cwndMode == 1)
++    {
++        offset = (uint64_t)(m_pacingRate.GetBitRate() * m_pacingOffset);
++        NS_LOG_DEBUG("Pacing rate offset: " << DataRate(offset));
++        if (halfVirtualRttElapsed)
++        {
++            rate = m_pacingRate.GetBitRate() - offset;
++            NS_LOG_DEBUG("Pacing rate updated (-): " << DataRate(rate));
++        }
++        else
++        {
++            rate = m_pacingRate.GetBitRate() + offset;
++            NS_LOG_DEBUG("Pacing rate updated (+): " << DataRate(rate));
++        }
++    }
++    else
++    {
++        mtu = tcb->m_mtu;
++        maxFlight = std::max(tcb->m_cWnd, tcb->m_bytesInFlight);
++
++        NS_LOG_DEBUG("****Cwnd " << tcb->m_cWnd << " bytes, bytesInFlight " << tcb->m_bytesInFlight << " bytes");
++
++        rate = static_cast<uint64_t>(mtu * 8);
++        NS_LOG_DEBUG("Initial rate based on MTU: " << rate);
++    }
++
++    if (tcb->m_cWnd < tcb->m_ssThresh / 2)
++    {
++        rate *= 2;
++        NS_LOG_DEBUG("In Slow Start, doubling pacing rate to: " << rate);
++    }
++
++    if (!IsRttIndependent(tcb) || m_cwndMode == 0)
++    {
++        if (tcb->m_srtt > Time(0))
++            rate = static_cast<uint64_t>((rate / tcb->m_srtt.Get().GetSeconds())); //in bps
++        rate = std::max((uint64_t)(rate * (double)(maxFlight / tcb->m_segmentSize)), DataRate("100kbps").GetBitRate());
++        NS_LOG_DEBUG("Pacing rate updated to: " << DataRate(rate));
++        m_pacingRate = DataRate(rate);
++    }
++
++    rate = std::min(rate, tcb->m_maxPacingRate.GetBitRate());
++
++    tcb->m_pacingRate = DataRate(rate);
++    NS_LOG_DEBUG("Final pacing rate set to: " << tcb->m_pacingRate);
++}
++
++uint32_t
++TcpPrague::GetSsThresh(Ptr<const TcpSocketState> tcb, uint32_t bytesInFlight)
++{
++    NS_LOG_FUNCTION(this << tcb << bytesInFlight);
++
++    return tcb->m_ssThresh;
++}
++
++void
++TcpPrague::ReduceCwnd(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    double reduction;
++
++    if (IsRttIndependent(tcb) &&
++        m_rttTarget > (Simulator::Now() - m_cwrStamp))
++    {
++        NS_LOG_DEBUG("Suppressing ReduceCwnd() since last reduction was at "
++                     << m_cwrStamp.As(Time::S));
++        return;
++    }
++
++    m_cwrStamp = Simulator::Now();
++
++    if (IsRttIndependent(tcb) && m_cwndMode == 1)
++    {
++        reduction = (((double) m_pacingRate.GetBitRate()) * m_alpha) / 2.0; //in bps
++        m_pacingRate =
++            std::max(m_pacingRate - DataRate(static_cast<uint64_t>(reduction)),
++                     DataRate("100kbps"));
++        m_fracCwnd = PacingRateToFracCwnd(tcb);
++
++        NS_LOG_DEBUG("Reducing m_pacingRate -> " << m_pacingRate << " m_fracCwnd -> " << m_fracCwnd);
++    }
++    else
++    {
++        reduction = m_fracCwnd * m_alpha / 2.0;
++        m_fracCwnd -= reduction;
++        NS_LOG_DEBUG("Reducing only m_fracCwnd -> " << m_fracCwnd);
++    }
++}
++
++uint32_t
++TcpPrague::SlowStart(Ptr<TcpSocketState> tcb, uint32_t acked)
++{
++    NS_LOG_FUNCTION(this << tcb << acked);
++    if (tcb->m_cWnd >= tcb->m_ssThresh)
++    {
++        NS_LOG_DEBUG("Return from SlowStart without action");
++        return acked;
++    }
++    uint32_t bytesAcked = acked * tcb->m_segmentSize;
++    uint32_t cwnd = std::min((tcb->m_cWnd + bytesAcked),
++                             tcb->m_ssThresh);
++
++    NS_ABORT_MSG_IF(cwnd < tcb->m_cWnd, "Subtraction overflow");
++    uint32_t segsUsed = (cwnd - tcb->m_cWnd) / tcb->m_segmentSize;
++    tcb->m_cWnd = cwnd;
++
++    NS_LOG_INFO("In SlowStart, updated to cwnd " << tcb->m_cWnd << "; returning " << acked - segsUsed
++                                                 << " segments left");
++    return acked - segsUsed;
++}
++
++void
++TcpPrague::UpdateCwnd(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rs)
++{
++    NS_LOG_FUNCTION(this << tcb << " Time " << Simulator::Now().GetSeconds());
++
++    double increase;
++    uint32_t newCwnd;
++
++    int32_t acked = rs.m_ackedSacked; // in bytes
++    acked = acked / tcb->m_segmentSize; // convert to segments for delta application
++    NS_LOG_DEBUG("Acked segments: " << acked);
++
++    if (tcb->m_delta)
++    {
++        NS_LOG_DEBUG("delta is " << tcb->m_delta);
++        if (!m_sawCE && !m_alphaMode)
++        {
++            NS_LOG_LOGIC("First CE mark in optimistic mode, halving cwnd");
++            m_fracCwnd = m_fracCwnd / 2.0;
++        }
++        m_sawCE = true;
++        acked -= tcb->m_delta;
++        NS_LOG_DEBUG("Reducing acked to " << acked);
++    }
++
++    NS_LOG_DEBUG("Acked " << acked << " in loss? " << m_inLoss << " app lim? " << rs.m_isAppLimited);
++
++    if (acked > 0 && !m_inLoss && !rs.m_isAppLimited)
++    {
++        if (tcb->m_cWnd < tcb->m_ssThresh)
++        {
++            NS_LOG_LOGIC("Prague in slow start");
++            acked = SlowStart(tcb, acked); //acked in segments
++            m_fracCwnd = (double)tcb->m_cWnd;
++            if (!acked)
++            {
++                CwndChanged(tcb);
++                return;
++            }
++        }
++
++        if (IsRttIndependent(tcb) && m_cwndMode == 1)
++        {
++            increase = (double) acked * 1500 / GetVirtualRtt(tcb).GetSeconds(); //in bytes/sec
++            newCwnd = std::ceil((m_pacingRate.GetBitRate() / 8.0) * GetVirtualRtt(tcb).GetSeconds() / tcb->m_mtu); //in packets
++            NS_LOG_DEBUG("***Increase per acked byte: " << increase);
++            if (newCwnd)
++                m_pacingRate = m_pacingRate.GetBitRate() + (uint64_t)((increase / newCwnd) * 8.0); //in bps
++
++            // frac cwnd in bytes
++            m_fracCwnd = std::max(m_fracCwnd + (acked * tcb->m_segmentSize), PacingRateToFracCwnd(tcb));
++            NS_LOG_DEBUG("Updated pacing rate to " << m_pacingRate);
++            NS_LOG_DEBUG("Increment frac cwnd to " << m_fracCwnd);
++        }
++        else
++        {
++            increase = (double)(acked * tcb->m_segmentSize) * m_aiAckIncrease; //in bytes * bytes
++            newCwnd = tcb->m_cWnd;
++            if (newCwnd)
++                increase = std::ceil(increase / newCwnd); //in bytes
++
++            NS_LOG_DEBUG("Current frac cwnd: " << m_fracCwnd);
++
++            m_fracCwnd += increase;
++            NS_LOG_DEBUG("Increment frac cwnd to " << m_fracCwnd);
++        }
++    }
++    else
++    {
++        NS_LOG_LOGIC("Acked is not effective or in loss or app limited");
++    }
++
++    newCwnd = FracCwndToBytes(tcb);
++    NS_LOG_DEBUG("New cwnd " << newCwnd << " tcb->cwnd " << tcb->m_cWnd);
++    if (tcb->m_cWnd > newCwnd)
++    {
++        NS_LOG_LOGIC("Step-wise cwnd decrement");
++        tcb->m_cWnd = tcb->m_cWnd - tcb->m_segmentSize;
++        tcb->m_ssThresh = tcb->m_cWnd;
++        CwndChanged(tcb);
++    }
++    else if (tcb->m_cWnd < newCwnd)
++    {
++        NS_LOG_LOGIC("Step-wise cwnd increment");
++        tcb->m_cWnd = tcb->m_cWnd + tcb->m_segmentSize;
++        CwndChanged(tcb);
++    }
++}
++
++void
++TcpPrague::UpdateAlpha(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    if (m_sawCE)
++    {
++        NS_LOG_DEBUG("CE seen... Delivered " << tcb->m_delivered << " CE Delivered " << tcb->m_deliveredCe);
++        double fractionEcn = 0.0;
++
++        if (tcb->m_delivered > m_oldDelivered)
++        {
++            uint32_t ackedSegs = tcb->m_delivered - m_oldDelivered;
++            uint32_t ecnSegs = (tcb->m_deliveredCe >= m_oldDeliveredCe) ?
++                                        (tcb->m_deliveredCe - m_oldDeliveredCe) : 0;
++
++            fractionEcn = static_cast<double>(ecnSegs) / ackedSegs;
++
++            NS_LOG_DEBUG("Round Stats: CE Pkts=" << ecnSegs
++                        << ", Total Pkts=" << ackedSegs
++                        << ", F=" << fractionEcn);
++        }
++        else
++        {
++            NS_LOG_DEBUG("Round Stats: No packets delivered since last NewRound. F = 0.0");
++            fractionEcn = 0.0;
++        }
++
++        double newAlpha = (1.0 - m_g) * m_alpha.Get() + m_g * fractionEcn;
++
++        newAlpha = std::min(1.0, std::max(0.0, newAlpha));
++        m_alpha = newAlpha;
++        m_alphaStamp = Simulator::Now();
++
++        NS_LOG_INFO("AccECN_UpdateAlpha," << fractionEcn << "," << m_alpha.Get() << ","
++                    << tcb->m_cWnd << "," << m_alphaStamp.GetSeconds());
++
++    }
++    else
++    {
++        NS_LOG_LOGIC("No CE seen yet, skipping alpha update");
++    }
++
++    /* * Linux Logic vs ns-3 Logic:
++    * Linux: Stores 'hsrtt' as a SCALED integer (RealValue * 128).
++    * Update: hsrtt = hsrtt + sample - (hsrtt >> 7)
++    * * ns-3:  Stores 'm_hsrtt' as the REAL Time value (Unscaled).
++    * To match the Linux weight of 1/128 (approx 0.0078), we implement
++    * the standard difference-based EWMA: New = Old + (Sample - Old) / 128.
++    */
++    if (!tcb->m_srtt.Get().IsZero())
++        m_hsrtt += (tcb->m_srtt.Get() - m_hsrtt) / 128;
++    else
++        NS_LOG_DEBUG("Skipping hsrtt update since srtt is zero");
++    NewRound(tcb);
++}
++
++void
++TcpPrague::PktsAcked(Ptr<TcpSocketState> tcb, uint32_t segmentsAcked, const Time& rtt)
++{
++    NS_LOG_FUNCTION(this << tcb << segmentsAcked << rtt);
++
++    return;
++}
++
++void
++TcpPrague::NewRound(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    m_nextSeq = tcb->m_nextTxSequence;
++    m_oldDeliveredCe = tcb->m_deliveredCe;
++    m_oldDelivered = tcb->m_delivered;
++    if (tcb->m_cWnd >= tcb->m_ssThresh)
++    {
++        ++m_round;
++        if (!m_round)
++            m_round = m_rttTransitionDelay;
++    }
++    AiAckIncrease(tcb);
++}
++
++void
++TcpPrague::CwndChanged(Ptr<TcpSocketState> tcb)
++{
++    // This method is similar to prague_cwnd_changed() in Linux
++    NS_LOG_FUNCTION(this << tcb);
++
++    AiAckIncrease(tcb);
++}
++
++void
++TcpPrague::EnterLoss(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    m_lossCwnd = tcb->m_cWnd;
++    m_lossPacingRate = m_pacingRate;
++
++    if (IsRttIndependent(tcb) && m_cwndMode == 1)
++    {
++        m_pacingRate -= m_pacingRate * 0.5;
++        m_fracCwnd = PacingRateToFracCwnd(tcb);
++    }
++    else
++        m_fracCwnd -= m_fracCwnd / 2.0;
++
++    m_inLoss = true;
++}
++
++void
++TcpPrague::CeState0to1(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    if (tcb->m_ecnMode == TcpSocketState::AccEcn)
++    {
++        NS_LOG_LOGIC("AccEcn mode: ignoring CeState0to1");
++        return;
++    }
++
++    if (!m_ceState && m_delayedAckReserved && m_priorRcvNxtFlag)
++    {
++        SequenceNumber32 tmpRcvNxt;
++        /* Save current NextRxSequence. */
++        tmpRcvNxt = tcb->m_rxBuffer->NextRxSequence();
++
++        /* Generate previous ACK without ECE */
++        tcb->m_rxBuffer->SetNextRxSequence(m_priorRcvNxt);
++        tcb->m_sendEmptyPacketCallback(TcpHeader::ACK);
++
++        /* Recover current RcvNxt. */
++        tcb->m_rxBuffer->SetNextRxSequence(tmpRcvNxt);
++    }
++
++    if (!m_priorRcvNxtFlag)
++    {
++        m_priorRcvNxtFlag = true;
++    }
++    m_priorRcvNxt = tcb->m_rxBuffer->NextRxSequence();
++    m_ceState = true;
++    tcb->m_ecnState = TcpSocketState::ECN_CE_RCVD;
++}
++
++void
++TcpPrague::CeState1to0(Ptr<TcpSocketState> tcb)
++{
++    NS_LOG_FUNCTION(this << tcb);
++
++    if (tcb->m_ecnMode == TcpSocketState::AccEcn)
++    {
++        NS_LOG_LOGIC("AccEcn mode: ignoring CeState1to0");
++        return;
++    }
++
++    if (m_ceState && m_delayedAckReserved && m_priorRcvNxtFlag)
++    {
++        SequenceNumber32 tmpRcvNxt;
++        /* Save current NextRxSequence. */
++        tmpRcvNxt = tcb->m_rxBuffer->NextRxSequence();
++
++        /* Generate previous ACK with ECE */
++        tcb->m_rxBuffer->SetNextRxSequence(m_priorRcvNxt);
++        tcb->m_sendEmptyPacketCallback(TcpHeader::ACK | TcpHeader::ECE);
++
++        /* Recover current RcvNxt. */
++        tcb->m_rxBuffer->SetNextRxSequence(tmpRcvNxt);
++    }
++
++    if (!m_priorRcvNxtFlag)
++    {
++        m_priorRcvNxtFlag = true;
++    }
++    m_priorRcvNxt = tcb->m_rxBuffer->NextRxSequence();
++    m_ceState = false;
++
++    if ((tcb->m_ecnState == TcpSocketState::ECN_CE_RCVD) ||
++        (tcb->m_ecnState == TcpSocketState::ECN_SENDING_ECE))
++    {
++        tcb->m_ecnState = TcpSocketState::ECN_IDLE;
++    }
++}
++
++void
++TcpPrague::UpdateAckReserved(Ptr<TcpSocketState> tcb, const TcpSocketState::TcpCAEvent_t event)
++{
++    NS_LOG_FUNCTION(this << tcb << event);
++
++    switch (event)
++    {
++    case TcpSocketState::CA_EVENT_DELAYED_ACK:
++        if (!m_delayedAckReserved)
++        {
++            m_delayedAckReserved = true;
++        }
++        break;
++    case TcpSocketState::CA_EVENT_NON_DELAYED_ACK:
++        if (m_delayedAckReserved)
++        {
++            m_delayedAckReserved = false;
++        }
++        break;
++    default:
++        /* Don't care for the rest. */
++        break;
++    }
++}
++
++void
++TcpPrague::CwndEvent(Ptr<TcpSocketState> tcb, const TcpSocketState::TcpCAEvent_t event)
++{
++    NS_LOG_FUNCTION(this << tcb << event);
++
++    switch (event)
++    {
++    case TcpSocketState::CA_EVENT_ECN_IS_CE:
++        CeState0to1(tcb);
++        break;
++    case TcpSocketState::CA_EVENT_ECN_NO_CE:
++        CeState1to0(tcb);
++        break;
++    case TcpSocketState::CA_EVENT_DELAYED_ACK:
++    case TcpSocketState::CA_EVENT_NON_DELAYED_ACK:
++        UpdateAckReserved(tcb, event);
++        break;
++    case TcpSocketState::CA_EVENT_CWND_RESTART:
++    case TcpSocketState::CA_EVENT_LOSS:
++        EnterLoss(tcb);
++        break;
++    case TcpSocketState::CA_EVENT_TX_START:
++    default:
++        break;
++    }
++}
++
++void
++TcpPrague::CongestionStateSet(Ptr<TcpSocketState> tcb,
++                              const TcpSocketState::TcpCongState_t newState)
++{
++    NS_LOG_FUNCTION(this << tcb << TcpSocketState::TcpCongStateName[newState]);
++
++    switch (newState)
++    {
++    case TcpSocketState::CA_OPEN:
++        m_inLoss = false;
++        break;
++    case TcpSocketState::CA_RECOVERY:
++        EnterLoss(tcb);
++        break;
++    case TcpSocketState::CA_CWR:
++        ReduceCwnd(tcb);
++        break;
++    default:
++        break;
++    }
++}
++
++void
++TcpPrague::SetRttTransitionDelay(uint32_t rounds)
++{
++    m_rttTransitionDelay = rounds;
++}
++
++bool
++TcpPrague::IsRttIndependent(Ptr<TcpSocketState> tcb)
++{
++    // This method is similar to prague_is_rtt_indep in Linux
++    return !(tcb->m_cWnd < tcb->m_ssThresh) &&
++        m_round >= m_rttTransitionDelay;
++}
++
++bool
++TcpPrague::ShouldUpdateEwma(Ptr<TcpSocketState> tcb)
++{
++    // This method is similar to prague_should_update_ewma in Linux
++    NS_LOG_FUNCTION(this << tcb);
++
++    bool pragueE2eRttElapsed = !(tcb->m_lastAckedSeq < m_nextSeq);
++    bool targetRttElapsed =
++        m_rttTarget <= Simulator::Now() - m_alphaStamp;
++
++    return pragueE2eRttElapsed &&
++        (!IsRttIndependent(tcb) || targetRttElapsed);
++}
++
++void
++TcpPrague::AiAckIncrease(Ptr<TcpSocketState> tcb)
++{
++    // This method is similar to prague_ai_ack_increase in Linux
++    NS_LOG_FUNCTION(this << tcb);
++
++    double increase;
++
++    Time rtt = tcb->m_srtt.Get();
++    Time maxScaledRtt = MilliSeconds(100);
++
++    if (m_round < m_rttTransitionDelay || rtt.IsZero() || rtt > maxScaledRtt)
++    {
++        NS_LOG_LOGIC("Using unscaled ai ack increase");
++        m_aiAckIncrease = tcb->m_segmentSize * 1.0; // 1 segment in bytes
++        return;
++    }
++
++    // rate scaled ack increase
++    Time target = m_rttTarget;
++    if (rtt >= target)
++    {
++        NS_LOG_LOGIC("rtt >= target, using unscaled ai ack increase");
++        increase = tcb->m_segmentSize * 1.0; //return prague unscaled
++    }
++    else
++    {
++        NS_LOG_LOGIC("Using rate scaled ai ack increase");
++        increase = tcb->m_segmentSize *
++            ((rtt.GetSeconds() * rtt.GetSeconds()) / (target.GetSeconds() * target.GetSeconds())); //in bytes
++    }
++
++    m_aiAckIncrease = increase;
++}
++
++} // namespace ns3
+\ No newline at end of file
+diff --git a/src/internet/model/tcp-prague.h b/src/internet/model/tcp-prague.h
+new file mode 100644
+index 000000000..348fbb277
+--- /dev/null
++++ b/src/internet/model/tcp-prague.h
+@@ -0,0 +1,255 @@
++/*
++ * Copyright (c) 2026 GPRT
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Author: Maria Eduarda Veras <maria.martins@gprt.ufpe.br>
++ *
++ */
++
++#ifndef TCP_PRAGUE_H
++#define TCP_PRAGUE_H
++
++#include "tcp-congestion-ops.h"
++
++#include "ns3/traced-value.h"
++
++namespace ns3
++{
++
++/**
++ * \ingroup tcp
++ *
++ * \brief An implementation of TCP Prague that is aligned with
++ * Linux: https://github.com/L4STeam/linux/tree/testing
++ *
++ * As of now, ns3::TcpPrague supports dynamic pacing rate and
++ * RTT Independence, both of which are present in Linux as well.
++ *
++ * This implementation is different from ns3::TcpDctcp in the
++ * following ways:
++ * 1. cWnd increment during Slow Start aligns with ns3::TcpLinuxReno
++ *
++ * 2. cWnd increment during Congestion Avoidance occurs discretely
++ * with the help of a cWnd counter, and is updated for every ACK
++ *
++ * 3. In case of ECE marks, cWnd is not immediately reduced by a
++ * factor of (1 - \alpha) / 2 but instead decremented by one segment
++ * for every ACK depending on the value of cWnd counter
++ *
++ */
++
++class TcpPrague : public TcpCongestionOps
++{
++  public:
++    /**
++     * \brief Get the type ID.
++     * \return the object TypeId
++     */
++    static TypeId GetTypeId();
++
++    TcpPrague();
++
++    /**
++     * \brief Copy constructor
++     * \param sock the object to copy
++     */
++    TcpPrague(const TcpPrague& sock);
++
++    ~TcpPrague() override;
++
++    std::string GetName() const override;
++
++    /**
++     * \brief Set configuration required by congestion control algorithm.
++     *        This method will force DctcpEcn mode and will force usage of
++     *        either ECT(0) or ECT(1) (depending on the 'UseEct0' attribute),
++     *        despite any other configuration in the base classes.
++     *
++     * \param tcb internal congestion state
++     */
++    void Init(Ptr<TcpSocketState> tcb) override;
++
++    /**
++     * \brief Sets the number of post-Slow Start rounds after which RTT independence is enabled
++     *
++     * \param rounds The RTT independence transition round delay
++     */
++    void SetRttTransitionDelay(uint32_t rounds);
++
++    /** \brief Return true if Prague is trying to achieve RTT independence
++     *
++     * \param tcb internal congestion state
++     * \return True if Prague is trying to achieve RTT independence
++     */
++    bool IsRttIndependent(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Update the congestion window
++     *
++     * \param tcb internal congestion state
++     * \param rateSample the rate sample from TcpRateOps
++     */
++    void UpdateCwnd(Ptr<TcpSocketState> tcb, const TcpRateOps::TcpRateSample& rateSample);
++
++    /**
++     * \brief Update the value of alpha
++     *
++     * \param tcb internal congestion state
++     */
++    void UpdateAlpha(Ptr<TcpSocketState> tcb);
++
++    Time GetVirtualRtt(Ptr<TcpSocketState> tcb) const;
++
++    /**
++     * \brief Update pacing parameters
++     *
++     * \param tcb internal congestion state
++     */
++    void UpdatePacingRate(Ptr<TcpSocketState> tcb);
++
++    // documented in base class
++    bool HasCongControl() const override;
++    void CongControl(Ptr<TcpSocketState> tcb,
++                     const TcpRateOps::TcpRateConnection& rc,
++                     const TcpRateOps::TcpRateSample& rs) override;
++    Ptr<TcpCongestionOps> Fork() override;
++    virtual void ReduceCwnd(Ptr<TcpSocketState> tcb);
++    void CwndEvent(Ptr<TcpSocketState> tcb, const TcpSocketState::TcpCAEvent_t event) override;
++    uint32_t GetSsThresh(Ptr<const TcpSocketState> tcb, uint32_t bytesInFlight) override;
++    void PktsAcked(Ptr<TcpSocketState> tcb, uint32_t segmentsAcked, const Time& rtt) override;
++    void CongestionStateSet(Ptr<TcpSocketState> tcb,
++                            const TcpSocketState::TcpCongState_t newState) override;
++
++  private:
++    /**
++     * \brief Update the congestion window during Slow Start
++     *
++     * \param tcb internal state
++     * \param acked segments acked
++     * \return remaining bytes after updating congestion window for slow start
++     */
++    virtual uint32_t SlowStart(Ptr<TcpSocketState> tcb, uint32_t acked);
++
++    /**
++     * \brief Fractional cWnd converted to cwnd (socket base)
++     *
++     * \param tcb internal state
++     */
++    uint32_t FracCwndToBytes(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Pacing rate converted to equivalent fractional cWnd
++     *
++     * \param tcb internal state
++     */
++    double_t PacingRateToFracCwnd(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Fractional cWnd converted to equivalent pacing rate
++     *
++     * \param tcb internal state
++     */
++    DataRate FracCwndToPacingRate(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Update the cWnd additive increase factor per ACK during Congestion Avoidance
++     *
++     * \param tcb internal state
++     */
++    void AiAckIncrease(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Return true if Prague EWMA should be updated
++     *
++     * \param tcb internal congestion state
++     */
++    bool ShouldUpdateEwma(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Update internal state when all packets in cWnd are ACKed
++     *
++     * \param tcb internal congestion state
++     */
++    void NewRound(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Update internal state whenever cWnd is updated
++     *
++     * \param tcb internal congestion state
++     */
++    void CwndChanged(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Update internal state when Prague encounters a loss
++     *
++     * \param tcb internal congestion state
++     */
++    void EnterLoss(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Changes state of m_ceState to true
++     *
++     * \param tcb internal congestion state
++     */
++    void CeState0to1(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Changes state of m_ceState to false
++     *
++     * \param tcb internal congestion state
++     */
++    void CeState1to0(Ptr<TcpSocketState> tcb);
++
++    /**
++     * \brief Updates the value of m_delayedAckReserved
++     *
++     * \param tcb internal congestion state
++     * \param event the congestion window event
++     */
++    void UpdateAckReserved(Ptr<TcpSocketState> tcb, const TcpSocketState::TcpCAEvent_t event);
++
++    /* Variables also present in ns3::TcpDctcp */
++    SequenceNumber32 m_priorRcvNxt; //!< Sequence number of the first missing byte in data
++    bool m_priorRcvNxtFlag; //!< Variable used in setting the value of m_priorRcvNxt for first time
++    TracedValue<double> m_alpha; //!< Parameter used to estimate the amount of network congestion
++    bool m_alphaMode;   //!< Mode for initial alpha
++    SequenceNumber32
++        m_nextSeq;      //!< TCP sequence number threshold for beginning a new observation window
++    bool m_nextSeqFlag; //!< Variable used in setting the value of m_nextSeq for first time
++    bool m_ceState;     //!< Prague Congestion Experienced state
++    bool m_delayedAckReserved; //!< Delayed Ack state
++    double m_g;                //!< Estimation gain
++
++    int m_pragueCwndMode;     ///!< Prague cWnd mode attribute (configurable)
++    bool m_cwndMode;          //!< Prague cWnd mode
++    bool m_cwndModeTransit;   //!< Prague cWnd mode transition state
++    uint32_t m_cwndTransit;
++    int m_ecnFallback;        //!< ECN fallback state (0 = none, 1 = detection & fallback, 2 = detection)
++
++    DataRate m_lossPacingRate; //!< Pacing rate during loss recovery
++    double_t m_lossCwnd;
++
++    double_t m_fracCwnd;       //!< Fractional cwnd (in bytes) to allow fine grain cwnd updates
++    DataRate m_pacingRate;     //!< Current internal pacing rate
++    double m_pacingOffset;   //!< Pacing rate offset to be added to the calculated pacing rate
++    uint32_t m_oldDeliveredCe{0};
++    uint32_t m_oldDelivered{0};
++
++    uint32_t m_lossWindowReduction{0}; //!< Amount to reduce cwnd after EnterLoss()
++    bool m_sawCE{false};               //!< True if Prague has received ECE flag before
++    bool m_inLoss{false};              //!< True if a packet loss occurs
++
++    /* Related to RTT Independence */
++    uint32_t m_round = 0;          //!< Round count since last slow start exit
++    uint32_t m_rttTransitionDelay; //!< Amount of post-SS rounds to transition to be RTT independent
++    Time m_alphaStamp;             //!< EWMA update timestamp
++    Time m_rttTarget;              //!< target RTT
++    Time m_hsrtt;                  //!< highest smoothed RTT
++    Time m_cwrStamp;               //!< Last time ReduceCwnd() was run
++    double_t m_aiAckIncrease;      //!< AI increase per non-CE ACKed MSS
++};
++
++} // namespace ns3
++
++#endif /* TCP_PRAGUE_H */
+\ No newline at end of file
+-- 
+2.34.1
+
