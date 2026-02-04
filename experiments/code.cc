@@ -40,7 +40,7 @@
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE ("DualQCoupledPiSquareExample");
+NS_LOG_COMPONENT_DEFINE ("L4SExample");
 
 uint32_t checkTimes;
 double avgQueueDiscSize;
