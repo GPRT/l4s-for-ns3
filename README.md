@@ -81,7 +81,7 @@ python3 /path/to/l4s-for-ns3/experiments/run-simulation.py
 
 This will:
 - Run 30 simulations (configurable via `NUM_RUNS`)
-- Save results to `exps/results_scenario_2_modif/run_X/`
+- Save results to `exps/results/run_X/`
 - Skip already completed runs
 
 ### Processing Results
