@@ -15,6 +15,7 @@ l4s-for-ns3/
 ├── experiments/
 │   ├── code.cc                     # Network simulation topology
 │   ├── run-simulation.py           # Automated batch execution script
+│   ├── create_plots.ipynb          # Jupyter notebook (R kernel) used to plot the results from the SBRC paper
 │   └── create_master_dataset.py    # Results consolidation script
 └── README.md
 ```
